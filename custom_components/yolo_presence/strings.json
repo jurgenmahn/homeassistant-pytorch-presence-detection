@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "YOLO Presence Detection",
+        "description": "Set up YOLO-based detection for people and pets. {has_gpu}",
+        "data": {
+          "name": "Name",
+          "stream_url": "RTSP Stream URL",
+          "model": "YOLO Model",
+          "detection_interval": "Detection Interval (seconds)",
+          "confidence_threshold": "Confidence Threshold",
+          "input_size": "Input Resolution",
+          "frame_skip_rate": "Frame Skip Rate"
+        }
+      }
+    },
+    "error": {
+      "stream_already_configured": "This stream URL is already configured",
+      "cannot_connect": "Failed to connect to stream",
+      "invalid_url": "Invalid stream URL",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "YOLO Presence Options",
+        "description": "Configure detection parameters",
+        "data": {
+          "stream_url": "RTSP Stream URL",
+          "model": "YOLO Model",
+          "detection_interval": "Detection Interval (seconds)",
+          "confidence_threshold": "Confidence Threshold",
+          "input_size": "Input Resolution",
+          "frame_skip_rate": "Frame Skip Rate"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to stream",
+      "invalid_url": "Invalid stream URL"
+    }
+  }
+}
