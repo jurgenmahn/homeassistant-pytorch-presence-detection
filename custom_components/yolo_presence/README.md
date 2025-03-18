@@ -1,6 +1,19 @@
-# Presence Detection from realtime camera feed (PyTorch/Yolo) for Home Assistant
+# Home Assistant YOLO Presence Detection Integration
 
-This integration uses YOLOv11 AI models to detect people and pets in camera feeds, providing presence detection for your home.
+This integration provides presence detection using YOLO object detection on camera streams. It uses a separate processing server to handle the video processing and ML inference, while providing seamless integration with Home Assistant entities and automations.
+
+## Major Update: New Architecture
+
+This is a major update to the YOLO Presence Detection integration, introducing a new split architecture:
+
+1. **Home Assistant Integration**: Handles the UI, configuration, entities, and events within Home Assistant
+2. **Processing Server**: A separate Docker container that handles video stream processing and ML inference
+
+This architecture provides several benefits:
+- **Python Version Compatibility**: Home Assistant requires Python 3.13, but PyTorch and Ultralytics don't fully support Python 3.13 yet
+- **Resource Isolation**: Processing can happen on a separate machine with a GPU
+- **Reduced Dependencies**: The HA component has minimal dependencies
+- **Scalability**: Multiple HA instances can connect to a single processing server, or one server can handle multiple cameras
 
 ## Features
 
@@ -10,11 +23,25 @@ This integration uses YOLOv11 AI models to detect people and pets in camera feed
 - **GPU Acceleration**: Automatically uses GPU acceleration (CUDA/ROCm) when available
 - **Adjustable Parameters**: Configure detection thresholds, intervals, and resolution
 - **Multiple Models**: Choose from different YOLO models based on your hardware capabilities
-- **Compatibility Mode**: Works with limited functionality even when PyTorch can't be installed
 
 ## Installation
 
-### HACS Installation (Recommended)
+### Step 1: Set up the Processing Server
+
+1. Clone the repository to your machine
+2. Navigate to the processing_unit directory
+3. Start the Docker container:
+
+```bash
+cd processing_unit
+docker-compose up -d
+```
+
+For more details, see the [processing server README](../../processing_unit/README.md).
+
+### Step 2: Install the Home Assistant Integration
+
+#### HACS Installation (Recommended)
 
 1. Ensure [HACS](https://hacs.xyz/) is installed
 2. Add this repository as a custom repository in HACS:
@@ -24,7 +51,7 @@ This integration uses YOLOv11 AI models to detect people and pets in camera feed
 3. Click "Install" on the YOLO Presence Detection integration
 4. Restart Home Assistant
 
-### Manual Installation
+#### Manual Installation
 
 1. Copy the `custom_components/yolo_presence` directory to your Home Assistant's `custom_components` directory
 2. Restart Home Assistant
@@ -35,8 +62,9 @@ The integration can be configured through the Home Assistant UI:
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for "YOLO Presence" and select it
-3. Enter the RTSP stream URL of your camera
-4. Configure optional parameters like detection interval, model, etc.
+3. Enter the processing server URL (e.g., http://192.168.1.100:5000)
+4. Enter the RTSP stream URL of your camera
+5. Configure optional parameters like detection interval, model, etc.
 
 ## Available Entities
 
@@ -51,7 +79,7 @@ Each camera instance will create the following entities:
 - **Pet Count**: Number of pets detected
 - **Last Detection**: Timestamp of the last detection
 - **Model Type**: The YOLO model being used
-- **Connection Status**: Status of the camera connection
+- **Connection Status**: Status of the processing server and camera connection
 
 ## Events
 
@@ -68,6 +96,7 @@ The integration fires the following events:
 | Option | Description | Default |
 |--------|-------------|---------|
 | Name | Name of the camera instance | YOLO Presence |
+| Processing Server | URL of the YOLO processing server | http://localhost:5000 |
 | Stream URL | RTSP URL of the camera | Required |
 | Model | YOLO model to use | YOLOv11L |
 | Detection Interval | Seconds between detections | 5s (GPU), 10s (CPU) |
@@ -77,9 +106,13 @@ The integration fires the following events:
 
 ## Hardware Requirements
 
-- For CPU mode: Any modern CPU (at least 2 cores recommended)
+### For the Processing Server:
+- Any machine capable of running Docker
 - For GPU acceleration: NVIDIA GPU with CUDA support or AMD GPU with ROCm support
 - At least 4GB of RAM (8GB+ recommended for larger models)
+
+### For Home Assistant:
+- Regular Home Assistant requirements (much lighter than before as processing happens externally)
 
 ## Models
 
@@ -91,32 +124,10 @@ The integration fires the following events:
 
 ## Troubleshooting
 
-- If the connection fails, check your RTSP URL format and network connectivity
-- If detection is inaccurate, try increasing the confidence threshold or using a larger model
-- If performance is poor, try a smaller model or increasing the detection interval
-- **Dependency Compatibility**: The integration will run in compatibility mode with limited functionality if OpenCV, PyTorch or Ultralytics cannot be installed. For full functionality with Python 3.13:
-  ```bash
-  # Install dependencies manually for full functionality with Python 3.13
-  pip install opencv-python-headless==4.8.1.78
-  pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cpu
-  pip install ultralytics
-  
-  # Alternative installation for older Python versions
-  pip install opencv-python-headless==4.8.1.78 torch==2.0.1 ultralytics==8.0.196
-  ```
-  
-  For Home Assistant users:
-  ```yaml
-  # Add this to your configuration.yaml
-  python_script:
-  
-  # Then create a file in <config>/python_scripts/install_yolo_deps.py
-  # with the following content:
-  import os
-  os.system('pip install opencv-python-headless==4.8.1.78 --break-system-packages')
-  os.system('pip install torch==2.0.1 --break-system-packages')
-  os.system('pip install ultralytics==8.0.196 --break-system-packages')
-  ```
+- If you experience connection issues, verify that your processing server is running and accessible from Home Assistant
+- Check that your camera stream URL is correct and accessible from the processing server
+- For CPU resource issues, try using a smaller model (nano or small) and increasing the detection interval
+- See the logs for more detailed error messages
 
 ## License
 

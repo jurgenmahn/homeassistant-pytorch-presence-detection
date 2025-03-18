@@ -28,6 +28,7 @@ from .const import (
     ATTR_MODEL_TYPE,
     ATTR_CONNECTION_STATUS,
 )
+from .api_client import YoloProcessingApiClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,14 +45,14 @@ SENSOR_TYPES: tuple[YoloPresenceSensorEntityDescription, ...] = (
         name="People Count",
         icon="mdi:account-group",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda detector: detector.people_count,
+        value_fn=lambda client: client.people_count,
     ),
     YoloPresenceSensorEntityDescription(
         key=ATTR_PET_COUNT,
         name="Pet Count",
         icon="mdi:paw",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda detector: detector.pet_count,
+        value_fn=lambda client: client.pet_count,
     ),
     YoloPresenceSensorEntityDescription(
         key=ATTR_LAST_DETECTION,
@@ -59,21 +60,21 @@ SENSOR_TYPES: tuple[YoloPresenceSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:clock-outline",
-        value_fn=lambda detector: detector.last_detection_time,
+        value_fn=lambda client: dt_util.utcfromtimestamp(client.last_update_time) if client.last_update_time else None,
     ),
     YoloPresenceSensorEntityDescription(
         key=ATTR_MODEL_TYPE,
         name="Model Type",
         icon="mdi:chip",
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda detector: detector.model_name,
+        value_fn=lambda client: client.model_name,
     ),
     YoloPresenceSensorEntityDescription(
         key=ATTR_CONNECTION_STATUS,
         name="Connection Status",
         icon="mdi:connection",
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda detector: detector.connection_status,
+        value_fn=lambda client: client.connection_status,
     ),
 )
 
@@ -84,11 +85,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up YOLO Presence sensors based on a config entry."""
-    detector = hass.data[DOMAIN][entry.entry_id]
+    client = hass.data[DOMAIN][entry.entry_id]
     
     # Add all sensor types
     async_add_entities(
-        YoloPresenceSensor(detector, entry, description)
+        YoloPresenceSensor(client, entry, description)
         for description in SENSOR_TYPES
     )
 
@@ -101,13 +102,13 @@ class YoloPresenceSensor(SensorEntity):
 
     def __init__(
         self, 
-        detector: Any, 
+        client: YoloProcessingApiClient, 
         entry: ConfigEntry,
         description: YoloPresenceSensorEntityDescription,
     ) -> None:
         """Initialize the sensor."""
         self.entity_description = description
-        self._detector = detector
+        self._client = client
         self._entry = entry
         
         # Set up entity attributes
@@ -116,7 +117,7 @@ class YoloPresenceSensor(SensorEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name=entry.data.get(CONF_NAME, "YOLO Presence"),
             manufacturer="Ultralytics",
-            model=f"YOLO Presence ({detector.model_name})",
+            model=f"YOLO Presence (Remote Processing)",
             sw_version="1.0",
         )
         
@@ -127,19 +128,19 @@ class YoloPresenceSensor(SensorEntity):
         """Register callbacks when entity is added."""
         # Register callback for state changes
         self.async_on_remove(
-            self._detector.register_update_callback(self._update_callback)
+            self._client.register_update_callback(self._update_callback)
         )
         
     @callback
     def _update_callback(self) -> None:
-        """Update the sensor state when detector state changes."""
+        """Update the sensor state when client state changes."""
         self._update_state()
         self.async_write_ha_state()
         
     def _update_state(self) -> None:
-        """Update the state from the detector."""
+        """Update the state from the client."""
         if self.entity_description.value_fn:
-            self._attr_native_value = self.entity_description.value_fn(self._detector)
+            self._attr_native_value = self.entity_description.value_fn(self._client)
             
     @property
     def available(self) -> bool:
@@ -149,4 +150,4 @@ class YoloPresenceSensor(SensorEntity):
             return True
             
         # For other sensors, available only when connected
-        return self._detector.connection_status == "connected"
+        return self._client.available

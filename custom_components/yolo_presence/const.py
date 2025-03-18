@@ -11,6 +11,7 @@ CONF_CONFIDENCE_THRESHOLD = "confidence_threshold"
 CONF_INPUT_SIZE = "input_size"
 CONF_MODEL = "model"
 CONF_FRAME_SKIP_RATE = "frame_skip_rate"
+CONF_PROCESSING_SERVER = "processing_server"
 
 # Entity attributes
 ATTR_DEVICE_ID = "device_id"
@@ -31,6 +32,7 @@ DEFAULT_INPUT_SIZE = "640x480"
 DEFAULT_MODEL = "yolo11l"
 DEFAULT_FRAME_SKIP_RATE_CPU = 5
 DEFAULT_FRAME_SKIP_RATE_GPU = 3
+DEFAULT_PROCESSING_SERVER = "http://localhost:5000"
 
 # SCAN_INTERVAL for sensors updates (seconds)
 SCAN_INTERVAL = 1
@@ -57,6 +59,14 @@ CLASS_MAP = {
     15: "bird",
     16: "cat", 
     17: "dog"
+}
+
+# Connection status
+CONNECTION_STATUS_OPTIONS = {
+    "connected": "Connected to camera and processing server",
+    "server_unavailable": "Processing server unavailable",
+    "server_disconnected": "Disconnected from processing server",
+    "disconnected": "Camera disconnected",
 }
 
 # Event types

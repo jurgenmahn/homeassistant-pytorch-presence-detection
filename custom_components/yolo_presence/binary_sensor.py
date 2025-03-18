@@ -21,6 +21,7 @@ from .const import (
     ATTR_HUMANS_DETECTED,
     ATTR_PETS_DETECTED,
 )
+from .api_client import YoloProcessingApiClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,14 +38,14 @@ BINARY_SENSOR_TYPES: tuple[YoloPresenceBinarySensorEntityDescription, ...] = (
         name="Person Detected",
         device_class=BinarySensorDeviceClass.PRESENCE,
         icon="mdi:account",
-        is_on_fn=lambda detector: detector.people_detected,
+        is_on_fn=lambda client: client.people_detected,
     ),
     YoloPresenceBinarySensorEntityDescription(
         key=ATTR_PETS_DETECTED,
         name="Pet Detected",
         device_class=BinarySensorDeviceClass.PRESENCE,
         icon="mdi:paw",
-        is_on_fn=lambda detector: detector.pets_detected,
+        is_on_fn=lambda client: client.pets_detected,
     ),
 )
 
@@ -55,10 +56,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up YOLO Presence binary sensors based on a config entry."""
-    detector = hass.data[DOMAIN][entry.entry_id]
+    client = hass.data[DOMAIN][entry.entry_id]
     
     async_add_entities(
-        YoloPresenceBinarySensor(detector, entry, description)
+        YoloPresenceBinarySensor(client, entry, description)
         for description in BINARY_SENSOR_TYPES
     )
 
@@ -71,13 +72,13 @@ class YoloPresenceBinarySensor(BinarySensorEntity):
 
     def __init__(
         self, 
-        detector: Any,
+        client: YoloProcessingApiClient,
         entry: ConfigEntry,
         description: YoloPresenceBinarySensorEntityDescription,
     ) -> None:
         """Initialize the binary sensor."""
         self.entity_description = description
-        self._detector = detector
+        self._client = client
         self._entry = entry
         
         # Entity attributes
@@ -86,7 +87,7 @@ class YoloPresenceBinarySensor(BinarySensorEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name=entry.data.get(CONF_NAME, "YOLO Presence"),
             manufacturer="Ultralytics",
-            model=f"YOLO Presence ({detector.model_name})",
+            model=f"YOLO Presence (Remote Processing)",
             sw_version="1.0",
         )
         
@@ -97,21 +98,21 @@ class YoloPresenceBinarySensor(BinarySensorEntity):
         """Register callbacks when entity is added."""
         # Register callback for state changes
         self.async_on_remove(
-            self._detector.register_update_callback(self._update_callback)
+            self._client.register_update_callback(self._update_callback)
         )
     
     @callback
     def _update_callback(self) -> None:
-        """Update the binary sensor state when detector state changes."""
+        """Update the binary sensor state when client state changes."""
         self._update_state()
         self.async_write_ha_state()
     
     def _update_state(self) -> None:
-        """Update the state from the detector."""
+        """Update the state from the client."""
         if self.entity_description.is_on_fn:
-            self._attr_is_on = self.entity_description.is_on_fn(self._detector)
+            self._attr_is_on = self.entity_description.is_on_fn(self._client)
 
     @property
     def available(self) -> bool:
         """Return if the binary sensor is available."""
-        return self._detector.connection_status == "connected"
+        return self._client.available

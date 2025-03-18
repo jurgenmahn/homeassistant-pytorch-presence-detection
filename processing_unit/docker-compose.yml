@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  yolo-presence-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yolo-presence-server
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - "../models:/app/models"  # Mount models directory for access to YOLO models
+    environment:
+      - PORT=5000
+      - DEBUG=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Remove this section if you don't have a GPU or are using a Mac/Windows
+    # On Linux, this is needed for NVIDIA GPU access
+    # Alternatively, you can use:
+    # runtime: nvidia
+    # If your Docker installation uses the NVIDIA Container Runtime by default
