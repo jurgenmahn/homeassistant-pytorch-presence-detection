@@ -2,7 +2,6 @@
 import logging
 import re
 import voluptuous as vol
-import cv2
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
@@ -10,8 +9,16 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
 
-# Try to import torch, but handle if not available
+# Try importing dependencies, handle if not available
+CV2_AVAILABLE = False
 TORCH_AVAILABLE = False
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    pass
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -43,6 +50,11 @@ _LOGGER = logging.getLogger(__name__)
 
 async def validate_stream_url(hass: HomeAssistant, stream_url: str) -> tuple[bool, str]:
     """Test if the stream URL can be accessed."""
+    # If OpenCV is not available, we can't validate the stream URL
+    if not CV2_AVAILABLE:
+        _LOGGER.warning("OpenCV not available, skipping stream URL validation")
+        return True, "OpenCV not installed, validation skipped"
+    
     def _test_stream():
         try:
             # Just try to open the stream without actually reading frames
@@ -135,10 +147,17 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # Prepare message about compatibility
         compatibility_message = ""
+        missing_deps = []
+        
+        if not CV2_AVAILABLE:
+            missing_deps.append("OpenCV")
         if not TORCH_AVAILABLE:
+            missing_deps.append("PyTorch")
+            
+        if missing_deps:
             compatibility_message = (
-                "PyTorch not installed. The integration will run in compatibility mode " 
-                "with limited functionality. Install PyTorch manually for full features."
+                f"{', '.join(missing_deps)} not installed. The integration will run in compatibility mode " 
+                f"with limited functionality. Install {' and '.join(missing_deps)} manually for full features."
             )
         elif has_cuda:
             compatibility_message = "GPU detected! Using optimized defaults."

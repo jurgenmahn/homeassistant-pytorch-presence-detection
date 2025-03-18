@@ -94,10 +94,28 @@ The integration fires the following events:
 - If the connection fails, check your RTSP URL format and network connectivity
 - If detection is inaccurate, try increasing the confidence threshold or using a larger model
 - If performance is poor, try a smaller model or increasing the detection interval
-- **PyTorch Compatibility**: The integration will run in compatibility mode with limited functionality if PyTorch cannot be installed. For full functionality with Python 3.13, you may need to install PyTorch manually:
+- **Dependency Compatibility**: The integration will run in compatibility mode with limited functionality if OpenCV, PyTorch or Ultralytics cannot be installed. For full functionality with Python 3.13:
   ```bash
+  # Install dependencies manually for full functionality with Python 3.13
+  pip install opencv-python-headless==4.8.1.78
   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cpu
   pip install ultralytics
+  
+  # Alternative installation for older Python versions
+  pip install opencv-python-headless==4.8.1.78 torch==2.0.1 ultralytics==8.0.196
+  ```
+  
+  For Home Assistant users:
+  ```yaml
+  # Add this to your configuration.yaml
+  python_script:
+  
+  # Then create a file in <config>/python_scripts/install_yolo_deps.py
+  # with the following content:
+  import os
+  os.system('pip install opencv-python-headless==4.8.1.78 --break-system-packages')
+  os.system('pip install torch==2.0.1 --break-system-packages')
+  os.system('pip install ultralytics==8.0.196 --break-system-packages')
   ```
 
 ## License

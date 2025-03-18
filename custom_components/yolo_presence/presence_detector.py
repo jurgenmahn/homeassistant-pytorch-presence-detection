@@ -9,12 +9,23 @@ from typing import Dict, List, Optional, Tuple, Any
 # Set up logging first
 _LOGGER = logging.getLogger(__name__)
 
-import cv2
-import numpy as np
-
-# Try to import torch/YOLO, but gracefully handle if not available
+# Try importing all potential dependencies, gracefully handling if any are not available
+CV2_AVAILABLE = False
+NUMPY_AVAILABLE = False
 TORCH_AVAILABLE = False
 YOLO_AVAILABLE = False
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    _LOGGER.warning("OpenCV (cv2) not available. Some features will be disabled.")
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    _LOGGER.warning("NumPy not available. Some features will be disabled.")
 
 try:
     import torch
@@ -340,6 +351,12 @@ class YoloPresenceDetector:
 
     async def async_open_stream(self) -> None:
         """Open the video stream."""
+        # If OpenCV is not available, we can't open the stream
+        if not CV2_AVAILABLE:
+            _LOGGER.warning("OpenCV not available, can't open video stream")
+            self.connection_status = "no_opencv"
+            return
+            
         def _open_stream():
             # Close any existing stream
             if self.cap is not None:
@@ -367,6 +384,10 @@ class YoloPresenceDetector:
 
     async def async_close_stream(self) -> None:
         """Close the video stream."""
+        if not CV2_AVAILABLE:
+            self.cap = None
+            return
+            
         if self.cap is not None:
             await self.hass.async_add_executor_job(self.cap.release)
             self.cap = None

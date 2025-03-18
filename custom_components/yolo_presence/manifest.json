@@ -7,8 +7,6 @@
   "documentation": "https://github.com/jurgenmahn/homeassistant-pytorch-presence-detection",
   "integration_type": "device",
   "iot_class": "local_push",
-  "requirements": [
-    "opencv-python-headless>=4.8.1.78,<4.10.0"
-  ],
+  "requirements": [],
   "version": "1.0.0"
 }
