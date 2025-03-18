@@ -44,7 +44,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Initialize the client and connect to the processing server
     if not await client.async_initialize(config):
-        _LOGGER.error(f"Failed to initialize YOLO processing client for {entry.title}")
+        _LOGGER.warning(f"Failed to initialize YOLO processing client for {entry.title}. Check the processing server status.")
         return False
     
     # Load integration platforms (sensors)

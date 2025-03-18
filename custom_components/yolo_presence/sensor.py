@@ -60,7 +60,7 @@ SENSOR_TYPES: tuple[YoloPresenceSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:clock-outline",
-        value_fn=lambda client: dt_util.utcfromtimestamp(client.last_update_time) if client.last_update_time else None,
+        value_fn=lambda client: dt_util.utc_from_timestamp(client.last_update_time) if client.last_update_time else None,
     ),
     YoloPresenceSensorEntityDescription(
         key=ATTR_MODEL_TYPE,

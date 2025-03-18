@@ -1,11 +1,12 @@
 """API client for communicating with the YOLO Presence Processing Server."""
 import asyncio
+import json
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Callable
 
 import aiohttp
-from aiohttp.client_exceptions import ClientConnectorError, ClientError
+from aiohttp.client_exceptions import ClientConnectorError, ClientError, ClientPayloadError
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.util.dt as dt_util
@@ -49,9 +50,13 @@ class YoloProcessingApiClient:
         self.model_name = None
         self.device = None
         
-        # Polling task
-        self._polling_task = None
+        # SSE connection
+        self._sse_task = None
         self._stop_event = asyncio.Event()
+        self._reconnect_delay = 1  # Initial reconnect delay in seconds
+        self._max_reconnect_delay = 60  # Maximum reconnect delay
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 10  # Max number of reconnect attempts before giving up
         
         # Callback handling
         self.update_callbacks = []
@@ -77,122 +82,247 @@ class YoloProcessingApiClient:
                 self.is_initialized = True
                 _LOGGER.info(f"Successfully initialized detector {self.detector_id} on server {self.server_url}")
                 
-                # Start polling for status updates
-                await self._start_polling()
+                # Start SSE connection for real-time updates
+                await self._start_sse_connection()
                 return True
             else:
-                _LOGGER.error(f"Failed to initialize detector: {result.get('error', 'Unknown error')}")
-                return False
+                error_msg = result.get("error", "Unknown error")
+                
+                # Check if the error is because the detector already exists
+                if "already exists" in error_msg:
+                    _LOGGER.warning(f"Detector {self.detector_id} already exists on server, attempting to reconnect")
+                    
+                    # Verify detector exists by getting its status
+                    status = await self._api_call("GET", f"/api/detectors/{self.detector_id}")
+                    if "error" not in status:
+                        # Detector exists and is accessible, so we can use it
+                        self.is_initialized = True
+                        _LOGGER.info(f"Successfully reconnected to existing detector {self.detector_id}")
+                        
+                        # Start SSE connection for real-time updates
+                        await self._start_sse_connection()
+                        return True
+                    else:
+                        _LOGGER.error(f"Detector exists but cannot be accessed: {status.get('error')}")
+                        return False
+                else:
+                    _LOGGER.error(f"Failed to initialize detector: {error_msg}")
+                    return False
                 
         except Exception as ex:
             _LOGGER.error(f"Error initializing connection to processing server: {str(ex)}")
             return False
 
-    async def _start_polling(self) -> None:
-        """Start polling the server for updates."""
-        if self._polling_task is not None:
+    async def _start_sse_connection(self) -> None:
+        """Start SSE connection for real-time updates."""
+        if self._sse_task is not None:
             return
             
         self._stop_event.clear()
-        self._polling_task = asyncio.create_task(self._polling_loop())
-        _LOGGER.debug(f"Started polling task for detector {self.detector_id}")
+        self._reconnect_attempts = 0
+        self._reconnect_delay = 1
+        self._sse_task = asyncio.create_task(self._sse_connection_loop())
+        _LOGGER.debug(f"Started SSE connection for detector {self.detector_id}")
 
-    async def _polling_loop(self) -> None:
-        """Poll the server for updates in a loop."""
-        last_successful_update = 0
-        
-        while not self._stop_event.is_set():
+    async def _sse_connection_loop(self) -> None:
+        """Maintain SSE connection with automatic reconnect."""
+        while not self._stop_event.is_set() and self._reconnect_attempts < self._max_reconnect_attempts:
             try:
-                # Get detector status from server
-                detector_status = await self._api_call("GET", f"/api/detectors/{self.detector_id}")
+                await self._connect_to_sse()
                 
-                if detector_status and "error" not in detector_status:
-                    # Update state from server response
-                    old_connection_status = self.connection_status
-                    old_people_detected = self.people_detected
-                    old_pets_detected = self.pets_detected
-                    old_people_count = self.people_count
-                    old_pet_count = self.pet_count
+                # If we get here, the connection closed normally
+                # Reset connection retries on successful connection
+                self._reconnect_attempts = 0
+                self._reconnect_delay = 1
+                
+                if not self._stop_event.is_set():
+                    _LOGGER.info(f"SSE connection closed, reconnecting for {self.detector_id}...")
+                    # Small delay before reconnect
+                    await asyncio.sleep(1)
+                
+            except (ClientConnectorError, ClientPayloadError, asyncio.TimeoutError):
+                # Connection failed, attempt to reconnect with backoff
+                if not self._stop_event.is_set():
+                    self._reconnect_attempts += 1
                     
-                    # Update local state
-                    self.is_running = detector_status.get("is_running", False)
-                    self.connection_status = detector_status.get("connection_status", "unknown")
-                    self.people_detected = detector_status.get("people_detected", False)
-                    self.pets_detected = detector_status.get("pets_detected", False)
-                    self.people_count = detector_status.get("people_count", 0)
-                    self.pet_count = detector_status.get("pet_count", 0)
-                    self.model_name = detector_status.get("model", "unknown")
-                    self.device = detector_status.get("device", "cpu")
+                    if self.connection_status != "server_unavailable":
+                        self.connection_status = "server_unavailable"
+                        await self._fire_connection_event("server_unavailable")
+                        self._call_update_callbacks()
                     
-                    # Only update timestamp after first successful update
-                    server_update_time = detector_status.get("last_update_time", 0)
-                    if server_update_time > self.last_update_time:
-                        self.last_update_time = server_update_time
+                    if self._reconnect_attempts < self._max_reconnect_attempts:
+                        _LOGGER.warning(
+                            f"SSE connection failed (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}), "
+                            f"reconnecting in {self._reconnect_delay}s..."
+                        )
                         
-                        # If anything important changed, call the update callbacks
-                        if (old_connection_status != self.connection_status or
-                            old_people_detected != self.people_detected or
-                            old_pets_detected != self.pets_detected or
-                            old_people_count != self.people_count or
-                            old_pet_count != self.pet_count):
-                            self._call_update_callbacks()
-                            
-                            # Fire events for significant changes
-                            if old_connection_status != self.connection_status:
-                                await self._fire_connection_event(self.connection_status)
-                                
-                            if old_people_detected != self.people_detected:
-                                await self._fire_human_event(self.people_detected)
-                                
-                            if old_pets_detected != self.pets_detected:
-                                await self._fire_pet_event(self.pets_detected)
-                                
-                            if old_people_count != self.people_count:
-                                await self._fire_human_count_event(self.people_count)
-                                
-                            if old_pet_count != self.pet_count:
-                                await self._fire_pet_count_event(self.pet_count)
-                    
-                    last_successful_update = time.time()
-                else:
-                    # Handle error response
-                    error_message = detector_status.get("error", "Unknown error")
-                    _LOGGER.warning(f"Error getting detector status: {error_message}")
-                    
-                    # If we haven't had a successful update for 30 seconds, mark as disconnected
-                    if time.time() - last_successful_update > 30:
-                        if self.connection_status != "server_disconnected":
-                            self.connection_status = "server_disconnected"
-                            await self._fire_connection_event("server_disconnected")
-                            self._call_update_callbacks()
+                        # Wait for reconnect delay (or until stop event)
+                        try:
+                            await asyncio.wait_for(self._stop_event.wait(), timeout=self._reconnect_delay)
+                        except asyncio.TimeoutError:
+                            pass
+                        
+                        # Increase reconnect delay with exponential backoff (max 60s)
+                        self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+                    else:
+                        _LOGGER.error(
+                            f"SSE connection failed after {self._max_reconnect_attempts} attempts. "
+                            f"Giving up for detector {self.detector_id}."
+                        )
+                        self.connection_status = "server_disconnected"
+                        await self._fire_connection_event("server_disconnected")
+                        self._call_update_callbacks()
             
-            except ClientConnectorError:
-                # Connection to server failed
-                if self.connection_status != "server_unavailable":
-                    self.connection_status = "server_unavailable"
-                    await self._fire_connection_event("server_unavailable")
-                    self._call_update_callbacks()
-                    
             except Exception as ex:
-                _LOGGER.error(f"Error in polling loop: {str(ex)}")
+                _LOGGER.error(f"Unexpected error in SSE connection: {str(ex)}")
+                if not self._stop_event.is_set():
+                    # Wait a bit before retry
+                    await asyncio.sleep(5)
+        
+        _LOGGER.debug(f"SSE connection loop ended for detector {self.detector_id}")
+
+    async def _connect_to_sse(self) -> None:
+        """Connect to the SSE endpoint and process events."""
+        session = async_get_clientsession(self.hass)
+        
+        try:
+            async with session.get(
+                f"{self.server_url}/api/detectors/{self.detector_id}/events",
+                timeout=30,
+                headers={"Accept": "text/event-stream"}
+            ) as response:
+                if response.status != 200:
+                    response_text = await response.text()
+                    _LOGGER.error(f"SSE connection failed with status {response.status}: {response_text}")
+                    raise ClientError(f"SSE connection failed with status {response.status}")
                 
-            # Wait for next update
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self.update_interval)
-            except asyncio.TimeoutError:
-                # This is expected - just continue with the next update
-                pass
+                # Connection established successfully
+                if self.connection_status == "server_unavailable":
+                    self.connection_status = "connected"
+                    await self._fire_connection_event("connected")
+                    self._call_update_callbacks()
+                
+                _LOGGER.debug(f"SSE connection established for {self.detector_id}")
+                
+                # Process the event stream
+                buffer = ""
+                
+                # Implementation based on aiohttp SSE client
+                async for line_bytes in response.content:
+                    # Reset reconnection attempts on successful data reception
+                    if self._reconnect_attempts > 0:
+                        self._reconnect_attempts = 0
+                        self._reconnect_delay = 1
+                        
+                    line = line_bytes.decode('utf8')
+                    buffer += line
+                    
+                    # Process complete messages (ending with double newline)
+                    if buffer.endswith('\n\n'):
+                        messages = buffer.split('\n\n')
+                        buffer = ""
+                        
+                        for message in messages:
+                            if not message:
+                                continue
+                                
+                            # Process each line in the message
+                            data = None
+                            event_type = None
+                            
+                            for msg_line in message.split('\n'):
+                                msg_line = msg_line.strip()
+                                
+                                # Skip empty lines and comments/keepalives
+                                if not msg_line or msg_line.startswith(':'):
+                                    continue
+                                
+                                if msg_line.startswith('data:'):
+                                    try:
+                                        data = json.loads(msg_line[5:].strip())
+                                    except json.JSONDecodeError as ex:
+                                        _LOGGER.warning(f"Invalid JSON in SSE message: {ex}")
+                                elif msg_line.startswith('event:'):
+                                    event_type = msg_line[6:].strip()
+                            
+                            # Process the message
+                            if data:
+                                await self._handle_sse_message(data)
+                            elif event_type and event_type in ('shutdown', 'detector_shutdown'):
+                                _LOGGER.info(f"Received {event_type} event from server")
+                                # Connection will be closed by server, we'll reconnect automatically
+                    
+                    # Check if we need to stop
+                    if self._stop_event.is_set():
+                        break
+                        
+                _LOGGER.debug(f"SSE stream ended for {self.detector_id}")
+        except Exception as ex:
+            _LOGGER.error(f"Error in SSE connection for {self.detector_id}: {str(ex)}")
+            raise
+
+    async def _handle_sse_message(self, data: Dict[str, Any]) -> None:
+        """Process an SSE message containing detector state."""
+        if not data:
+            return
+            
+        # Update state from server response
+        old_connection_status = self.connection_status
+        old_people_detected = self.people_detected
+        old_pets_detected = self.pets_detected
+        old_people_count = self.people_count
+        old_pet_count = self.pet_count
+        
+        # Update local state
+        self.is_running = data.get("is_running", self.is_running)
+        self.connection_status = data.get("connection_status", self.connection_status)
+        self.people_detected = data.get("people_detected", self.people_detected)
+        self.pets_detected = data.get("pets_detected", self.pets_detected)
+        self.people_count = data.get("people_count", self.people_count)
+        self.pet_count = data.get("pet_count", self.pet_count)
+        self.model_name = data.get("model", self.model_name)
+        self.device = data.get("device", self.device)
+        
+        # Update timestamp
+        server_update_time = data.get("last_update_time", 0)
+        if server_update_time > self.last_update_time:
+            self.last_update_time = server_update_time
+        
+        # If anything important changed, call the update callbacks and fire events
+        if (old_connection_status != self.connection_status or
+            old_people_detected != self.people_detected or
+            old_pets_detected != self.pets_detected or
+            old_people_count != self.people_count or
+            old_pet_count != self.pet_count):
+            
+            self._call_update_callbacks()
+            
+            # Fire events for significant changes
+            if old_connection_status != self.connection_status:
+                await self._fire_connection_event(self.connection_status)
+                
+            if old_people_detected != self.people_detected:
+                await self._fire_human_event(self.people_detected)
+                
+            if old_pets_detected != self.pets_detected:
+                await self._fire_pet_event(self.pets_detected)
+                
+            if old_people_count != self.people_count:
+                await self._fire_human_count_event(self.people_count)
+                
+            if old_pet_count != self.pet_count:
+                await self._fire_pet_count_event(self.pet_count)
 
     async def async_shutdown(self) -> None:
         """Shutdown the client and delete the detector on the server."""
-        # Stop polling
-        if self._polling_task is not None:
+        # Stop SSE connection
+        if self._sse_task is not None:
             self._stop_event.set()
             try:
-                await self._polling_task
+                await self._sse_task
             except asyncio.CancelledError:
                 pass
-            self._polling_task = None
+            self._sse_task = None
         
         # Delete detector on server if we're initialized
         if self.is_initialized:

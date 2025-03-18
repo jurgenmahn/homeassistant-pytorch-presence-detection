@@ -17,8 +17,9 @@ from typing import Dict, List, Optional, Any, Tuple
 import cv2
 import numpy as np
 import torch
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+import queue
 from ultralytics import YOLO
 
 # Configure logging
@@ -44,6 +45,10 @@ CLASS_MAP = {
 # Store for detector instances (key: detector_id)
 detectors = {}
 detector_lock = threading.Lock()
+
+# Store SSE client queues for each detector (key: detector_id)
+sse_clients = {}
+sse_clients_lock = threading.Lock()
 
 class YoloDetector:
     """YOLO-based object detector for video streams."""
@@ -367,12 +372,15 @@ class YoloDetector:
             self.pet_count = pet_count
             self.last_detection_time = time.time()
             
-            # If anything changed, update the last_update_time
+            # If anything changed, update the last_update_time and notify clients
             if (old_people_detected != self.people_detected or 
                 old_pets_detected != self.pets_detected or
                 old_people_count != self.people_count or
                 old_pet_count != self.pet_count):
                 self.last_update_time = time.time()
+                
+                # Notify SSE clients of the state change
+                self._notify_sse_clients()
                 
                 # Log detection results
                 if self.people_count > 0 or self.pet_count > 0:
@@ -425,6 +433,16 @@ class YoloDetector:
             gc.collect()
         except Exception:
             pass
+        
+        # Notify all SSE clients that this detector is shutting down
+        with sse_clients_lock:
+            if self.detector_id in sse_clients:
+                shutdown_message = f"event: detector_shutdown\ndata: {json.dumps({'detector_id': self.detector_id})}\n\n"
+                for client_queue in sse_clients[self.detector_id]:
+                    try:
+                        client_queue.put_nowait(shutdown_message)
+                    except queue.Full:
+                        pass  # Ignore if queue is full
             
         logger.debug(f"YOLO detector shutdown complete for {self.name}")
 
@@ -444,6 +462,28 @@ class YoloDetector:
             "last_detection_time": self.last_detection_time,
             "last_update_time": self.last_update_time,
         }
+        
+    def _notify_sse_clients(self):
+        """Notify SSE clients of state changes."""
+        with sse_clients_lock:
+            if self.detector_id in sse_clients:
+                # Create state message
+                state = self.get_state()
+                message = f"data: {json.dumps(state)}\n\n"
+                
+                # Send to all clients
+                dead_clients = []
+                for client_queue in sse_clients[self.detector_id]:
+                    try:
+                        client_queue.put_nowait(message)
+                    except queue.Full:
+                        # Client queue is full and not being read, mark for removal
+                        dead_clients.append(client_queue)
+                
+                # Remove dead clients
+                for dead_client in dead_clients:
+                    if dead_client in sse_clients[self.detector_id]:
+                        sse_clients[self.detector_id].remove(dead_client)
 
 
 # API Routes
@@ -550,6 +590,58 @@ def get_detector_frame(detector_id):
         except Exception as ex:
             return jsonify({"error": f"Error encoding frame: {str(ex)}"}), 500
 
+@app.route('/api/detectors/<detector_id>/events', methods=['GET'])
+def detector_events(detector_id):
+    """SSE endpoint for real-time detector state updates."""
+    with detector_lock:
+        if detector_id not in detectors:
+            return jsonify({"error": f"Detector {detector_id} not found"}), 404
+        
+        detector = detectors[detector_id]
+    
+    def event_stream():
+        """Generate SSE event stream."""
+        # Create queue for this client
+        client_queue = queue.Queue(maxsize=10)
+        
+        # Register this client
+        with sse_clients_lock:
+            if detector_id not in sse_clients:
+                sse_clients[detector_id] = []
+            sse_clients[detector_id].append(client_queue)
+        
+        # Send initial state
+        state = detector.get_state()
+        yield f"data: {json.dumps(state)}\n\n"
+        
+        try:
+            while True:
+                try:
+                    # Wait for messages, timeout after 30 seconds to send keepalive
+                    message = client_queue.get(timeout=30)
+                    yield message
+                except queue.Empty:
+                    # Send keepalive message
+                    yield ": keepalive\n\n"
+        finally:
+            # Remove client when connection is closed
+            with sse_clients_lock:
+                if detector_id in sse_clients and client_queue in sse_clients[detector_id]:
+                    sse_clients[detector_id].remove(client_queue)
+                    # Clean up empty detector list
+                    if not sse_clients[detector_id]:
+                        del sse_clients[detector_id]
+    
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable proxy buffering
+            "Connection": "keep-alive"
+        }
+    )
+
 
 # Graceful shutdown handler
 def graceful_shutdown(signum, frame):
@@ -563,6 +655,16 @@ def graceful_shutdown(signum, frame):
                 detector.shutdown()
             except Exception as ex:
                 logger.error(f"Error shutting down detector {detector_id}: {str(ex)}")
+    
+    # Notify SSE clients that server is shutting down
+    with sse_clients_lock:
+        for detector_id, client_queues in list(sse_clients.items()):
+            shutdown_message = f"event: shutdown\ndata: {json.dumps({'detector_id': detector_id})}\n\n"
+            for client_queue in client_queues:
+                try:
+                    client_queue.put_nowait(shutdown_message)
+                except queue.Full:
+                    pass  # Ignore if queue is full
     
     # Exit
     os._exit(0)
