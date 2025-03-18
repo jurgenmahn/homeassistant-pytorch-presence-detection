@@ -16,7 +16,6 @@ from .const import (
     CONF_CONFIDENCE_THRESHOLD,
     CONF_INPUT_SIZE,
     CONF_MODEL,
-    CONF_FRAME_SKIP_RATE,
     CONF_PROCESSING_SERVER,
     DEFAULT_NAME,
     DEFAULT_DETECTION_INTERVAL_CPU,
@@ -121,8 +120,6 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.All(vol.Coerce(float), vol.Range(min=0.1, max=0.9)),
             vol.Required(CONF_INPUT_SIZE, default=DEFAULT_INPUT_SIZE): 
                 vol.In(INPUT_SIZE_OPTIONS),
-            vol.Required(CONF_FRAME_SKIP_RATE, default=default_frame_skip_rate): 
-                vol.All(vol.Coerce(int), vol.Range(min=1, max=20)),
         })
 
         # Prepare message about architecture
@@ -194,10 +191,6 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                 CONF_INPUT_SIZE, 
                 default=current_settings.get(CONF_INPUT_SIZE, DEFAULT_INPUT_SIZE)
             ): vol.In(INPUT_SIZE_OPTIONS),
-            vol.Required(
-                CONF_FRAME_SKIP_RATE, 
-                default=current_settings.get(CONF_FRAME_SKIP_RATE, DEFAULT_FRAME_SKIP_RATE_CPU)
-            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=20)),
         })
 
         return self.async_show_form(

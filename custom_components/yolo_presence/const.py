@@ -10,7 +10,6 @@ CONF_DETECTION_INTERVAL = "detection_interval"
 CONF_CONFIDENCE_THRESHOLD = "confidence_threshold"
 CONF_INPUT_SIZE = "input_size"
 CONF_MODEL = "model"
-CONF_FRAME_SKIP_RATE = "frame_skip_rate"
 CONF_PROCESSING_SERVER = "processing_server"
 
 # Entity attributes
