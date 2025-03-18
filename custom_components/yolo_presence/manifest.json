@@ -1,16 +1,14 @@
 {
   "domain": "yolo_presence",
-  "name": "YOLO Presence Detection",
-  "codeowners": ["@jurgen"],
+  "name": "Presence Detection from realtime camera feed (PyTorch/Yolo)",
+  "codeowners": ["@jurgenmahn"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/jurgen/yolo-presence-homeassistant",
+  "documentation": "https://github.com/jurgenmahn/homeassistant-pytorch-presence-detection",
   "integration_type": "device",
   "iot_class": "local_push",
   "requirements": [
-    "torch>=2.0.0",
-    "ultralytics>=8.0.0",
-    "opencv-python>=4.5.0"
+    "opencv-python-headless>=4.8.1.78,<4.10.0"
   ],
   "version": "1.0.0"
 }

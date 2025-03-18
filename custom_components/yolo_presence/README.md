@@ -1,4 +1,4 @@
-# YOLO Presence Detection for Home Assistant
+# Presence Detection from realtime camera feed (PyTorch/Yolo) for Home Assistant
 
 This integration uses YOLOv11 AI models to detect people and pets in camera feeds, providing presence detection for your home.
 
@@ -10,6 +10,7 @@ This integration uses YOLOv11 AI models to detect people and pets in camera feed
 - **GPU Acceleration**: Automatically uses GPU acceleration (CUDA/ROCm) when available
 - **Adjustable Parameters**: Configure detection thresholds, intervals, and resolution
 - **Multiple Models**: Choose from different YOLO models based on your hardware capabilities
+- **Compatibility Mode**: Works with limited functionality even when PyTorch can't be installed
 
 ## Installation
 
@@ -93,6 +94,11 @@ The integration fires the following events:
 - If the connection fails, check your RTSP URL format and network connectivity
 - If detection is inaccurate, try increasing the confidence threshold or using a larger model
 - If performance is poor, try a smaller model or increasing the detection interval
+- **PyTorch Compatibility**: The integration will run in compatibility mode with limited functionality if PyTorch cannot be installed. For full functionality with Python 3.13, you may need to install PyTorch manually:
+  ```bash
+  pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cpu
+  pip install ultralytics
+  ```
 
 ## License
 
@@ -100,4 +106,4 @@ This project is licensed under the MIT License.
 
 ---
 
-Created by Jurgen Mahn, based on Ultralytics YOLO.
+Created by Jurgen Mahn with assistance from Claude Code, based on Ultralytics YOLO.

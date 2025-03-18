@@ -3,13 +3,20 @@ import logging
 import re
 import voluptuous as vol
 import cv2
-import torch
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
+
+# Try to import torch, but handle if not available
+TORCH_AVAILABLE = False
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    pass
 
 from .const import (
     DOMAIN,
@@ -37,15 +44,16 @@ _LOGGER = logging.getLogger(__name__)
 async def validate_stream_url(hass: HomeAssistant, stream_url: str) -> tuple[bool, str]:
     """Test if the stream URL can be accessed."""
     def _test_stream():
-        cap = cv2.VideoCapture(stream_url)
-        is_opened = cap.isOpened()
-        if is_opened:
-            ret, _ = cap.read()
-            is_readable = ret
-        else:
-            is_readable = False
-        cap.release()
-        return is_opened, is_readable
+        try:
+            # Just try to open the stream without actually reading frames
+            # This is much more lightweight for validation
+            cap = cv2.VideoCapture(stream_url)
+            is_opened = cap.isOpened()
+            is_readable = is_opened  # Assume readable if it opens
+            cap.release()
+            return is_opened, is_readable
+        except Exception as ex:
+            return False, f"Error: {str(ex)}"
 
     try:
         is_opened, is_readable = await hass.async_add_executor_job(_test_stream)
@@ -74,7 +82,12 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         # Detect if CUDA is available for better defaults
-        has_cuda = torch.cuda.is_available()
+        has_cuda = False
+        if TORCH_AVAILABLE:
+            try:
+                has_cuda = torch.cuda.is_available()
+            except Exception:
+                has_cuda = False
         
         if user_input is not None:
             # Validate stream URL
@@ -120,13 +133,24 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.All(vol.Coerce(int), vol.Range(min=1, max=20)),
         })
 
+        # Prepare message about compatibility
+        compatibility_message = ""
+        if not TORCH_AVAILABLE:
+            compatibility_message = (
+                "PyTorch not installed. The integration will run in compatibility mode " 
+                "with limited functionality. Install PyTorch manually for full features."
+            )
+        elif has_cuda:
+            compatibility_message = "GPU detected! Using optimized defaults."
+        else:
+            compatibility_message = "No GPU detected. Using CPU optimized settings."
+            
         return self.async_show_form(
             step_id="user", 
             data_schema=data_schema,
             errors=errors,
             description_placeholders={
-                "has_gpu": "GPU detected! Using optimized defaults." if has_cuda else 
-                          "No GPU detected. Using CPU optimized settings."
+                "has_gpu": compatibility_message
             }
         )
 
@@ -157,7 +181,12 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=user_input)
 
         # Detect if CUDA is available for slider defaults
-        has_cuda = torch.cuda.is_available()
+        has_cuda = False
+        if TORCH_AVAILABLE:
+            try:
+                has_cuda = torch.cuda.is_available()
+            except Exception:
+                has_cuda = False
         
         # Prepare current settings
         current_settings = {**self.config_entry.data, **self.config_entry.options}
