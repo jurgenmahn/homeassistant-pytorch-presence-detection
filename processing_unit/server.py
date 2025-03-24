@@ -761,10 +761,15 @@ class YoloDetector:
         }
 
 
-def write_message_to_socket(sock: socket.socket, message: Dict[str, Any]) -> bool:
+def write_message_to_socket(sock: socket.socket, message: Dict[str, Any], restore_timeout: int = 60) -> bool:
     """
     Write a message to a socket.
     
+    Args:
+        sock: Socket to write to
+        message: Message to send
+        restore_timeout: Timeout in seconds to restore after sending (default 60s)
+        
     Returns:
         bool: True if successful, False if connection broken
     """
@@ -772,6 +777,13 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any]) -> boo
     if sock is None:
         socket_logger.warning("Cannot send message to None socket")
         return False
+    
+    # Save original timeout to restore later
+    original_timeout = None
+    try:
+        original_timeout = sock.gettimeout()
+    except Exception:
+        pass
         
     # Check socket validity
     try:
@@ -842,11 +854,19 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any]) -> boo
         socket_logger.error(f"Error writing to socket: {str(ex)}", exc_info=True)
         return False
     finally:
-        # Reset timeout to default
+        # Restore original timeout or set to requested timeout
         try:
-            sock.settimeout(None)
-        except:
-            pass
+            # If we have a valid original timeout, use it, otherwise use the specified restore_timeout
+            timeout_value = original_timeout if original_timeout is not None else restore_timeout
+            sock.settimeout(timeout_value)
+            socket_logger.debug(f"Restored socket timeout to {timeout_value}s")
+        except Exception as ex:
+            socket_logger.warning(f"Failed to restore socket timeout: {ex}")
+            # Last resort - try to set a reasonable timeout to avoid blocking
+            try:
+                sock.settimeout(restore_timeout)
+            except:
+                pass
 
 
 def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None:
@@ -943,8 +963,16 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
         
         # Respond with auth success
         response = {"type": "auth_success"}
-        if not write_message_to_socket(sock, response):
+        if not write_message_to_socket(sock, response, restore_timeout=30):
             socket_logger.warning(f"Connection lost with client {addr} while sending auth success message")
+            return
+            
+        # After auth success, immediately send a heartbeat/keepalive
+        # This ensures the client connection remains active during registration
+        # and prevents watchdog timeouts
+        keepalive_msg = {"type": "keepalive", "server_timestamp": time.time()}
+        if not write_message_to_socket(sock, keepalive_msg, restore_timeout=30):
+            socket_logger.warning(f"Connection lost with client {addr} while sending initial keepalive")
             return
         
         # Register client with detector
@@ -971,10 +999,14 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
                 
             # Add new connection
             socket_clients[detector_id].add(sock)
+            
+            socket_logger.info(f"Client {addr} registered with detector {detector_id} (total clients: {len(socket_clients[detector_id])})")
         
-        # Set a longer timeout for established connection
+        # Set a longer timeout for established connection (but not unlimited)
         try:
-            sock.settimeout(60)  # 60 second timeout for normal operation
+            socket_timeout = 60  # 60 second timeout for normal operation
+            sock.settimeout(socket_timeout)
+            socket_logger.debug(f"Set socket timeout to {socket_timeout}s for established connection")
         except Exception as timeout_ex:
             socket_logger.warning(f"Failed to set socket timeout: {timeout_ex}")
             
@@ -1037,11 +1069,13 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
                 message_type = message.get("type", "unknown")
                 
                 if message_type == "heartbeat":
-                    # Respond with heartbeat
-                    response = {"type": "heartbeat"}
-                    if not write_message_to_socket(sock, response):
+                    socket_logger.debug(f"Received heartbeat from client {addr}")
+                    # Respond with heartbeat response with timestamp
+                    response = {"type": "heartbeat_response", "server_timestamp": time.time()}
+                    if not write_message_to_socket(sock, response, restore_timeout=60):
                         socket_logger.warning(f"Failed to send heartbeat response to client {addr}")
                         break
+                    socket_logger.debug(f"Sent heartbeat response to client {addr}")
                     
                 elif message_type == "get_state":
                     # Send current detector state

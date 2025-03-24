@@ -461,10 +461,9 @@ class SocketWatchdog:
             # Additional check: Try to send/receive data
             try:
                 # Send a valid message format that the server would expect
-                # This is a simplistic auth message just to test connection
+                # Use heartbeat message instead of auth (less disruptive)
                 test_message = {
-                    "type": "auth", 
-                    "detector_id": "socket_watchdog_test"
+                    "type": "heartbeat"
                 }
                 
                 import json
@@ -474,12 +473,44 @@ class SocketWatchdog:
                 # Send message length followed by message
                 sock.sendall(length_bytes + message_bytes)
                 
-                # Try to receive response (just the length header is enough to verify connection)
-                response_length = sock.recv(4)
-                if not response_length or len(response_length) != 4:
+                # Try to receive response (read the full message)
+                # First read the length
+                response_length_bytes = sock.recv(4)
+                if not response_length_bytes or len(response_length_bytes) != 4:
                     logger.warning("Socket check failed: couldn't receive response length")
                     return False
-                
+                    
+                # Parse the length
+                response_length = int.from_bytes(response_length_bytes, byteorder="big")
+                if response_length <= 0 or response_length > 1024 * 1024:  # Max 1MB
+                    logger.warning(f"Socket check failed: invalid response length {response_length}")
+                    return False
+                    
+                # Now read the response data
+                data = b""
+                remaining = response_length
+                while remaining > 0:
+                    chunk = sock.recv(min(remaining, 8192))
+                    if not chunk:  # Connection closed
+                        logger.warning("Socket check failed: connection closed while reading response")
+                        return False
+                    data += chunk
+                    remaining -= len(chunk)
+                    
+                # Try to parse the response
+                try:
+                    response = json.loads(data.decode("utf-8"))
+                    # Look for heartbeat_response or any valid message type
+                    if "type" in response:
+                        logger.debug(f"Socket check succeeded: received {response.get('type')} response")
+                        return True
+                    else:
+                        logger.warning(f"Socket check failed: received response with no type: {response}")
+                        return False
+                except Exception as parse_err:
+                    logger.warning(f"Socket check failed: couldn't parse response: {parse_err}")
+                    return False
+                    
                 # Successfully sent and received data
                 return True
                 
@@ -742,8 +773,9 @@ def start_watchdog(enable_socket_watchdog=True):
             host=watchdog_host,
             port=port,
             restart_callback=restart_server_process,
-            check_interval=60,  # Check every 60 seconds
-            max_failures=3      # Restart after 3 consecutive failures
+            check_interval=30,  # Check every 30 seconds
+            max_failures=3,     # Restart after 3 consecutive failures
+            restart_delay=2     # Quick restart delay
         )
 
 def stop_watchdog():
