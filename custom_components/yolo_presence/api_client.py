@@ -714,8 +714,19 @@ class YoloProcessingApiClient:
                 self._connected = False
                 self._reconnect_event.set()
 
+    # Message start and end markers
+    _MESSAGE_START = b'<<<START>>>'
+    _MESSAGE_END = b'<<<END>>>'
+    _MESSAGE_BUFFER_SIZE = 4096  # Read buffer size
+    _READ_TIMEOUT = 15  # Longer timeout for overall message reading
+
     async def _read_message(self) -> Dict[str, Any]:
-        """Read a message from the server."""
+        """
+        Read a message from the server using start/end markers instead of length prefixes.
+        
+        This approach is more robust as it doesn't rely on reading the exact message length
+        up front, which can cause timeouts if there are network delays.
+        """
         if not self._reader:
             raise ConnectionError("Not connected to server")
 
@@ -725,66 +736,82 @@ class YoloProcessingApiClient:
                 _LOGGER.warning("Writer is closing, cannot read message")
                 raise ConnectionError("Writer is closing")
 
-            # Read message length (4 bytes)
+            # Use a single timeout for the entire read operation
+            start_time = time.time()
+            buffer = bytearray()
+            message_started = False
+            
             try:
-                # Use a timeout to prevent hanging on read operations
+                # Keep reading until we find the end marker or timeout
+                while True:
+                    # Use a longer overall timeout
+                    chunk = await asyncio.wait_for(
+                        self._reader.read(self._MESSAGE_BUFFER_SIZE), 
+                        timeout=self._READ_TIMEOUT
+                    )
+                    
+                    if not chunk:  # Connection closed
+                        if message_started:
+                            _LOGGER.warning("Connection closed before end marker received")
+                        raise ConnectionError("Connection closed unexpectedly")
+                    
+                    # Look for start marker if we haven't found it yet
+                    if not message_started:
+                        start_pos = chunk.find(self._MESSAGE_START)
+                        if start_pos >= 0:
+                            # Found start marker, keep data after it
+                            buffer.extend(chunk[start_pos + len(self._MESSAGE_START):])
+                            message_started = True
+                            _LOGGER.debug("Found message start marker")
+                        # Otherwise keep looking
+                    else:
+                        # Already found start, append all data and check for end
+                        buffer.extend(chunk)
+                    
+                    # Check for end marker if we've started a message
+                    if message_started:
+                        end_pos = buffer.find(self._MESSAGE_END)
+                        if end_pos >= 0:
+                            # Found end marker, extract message
+                            message_data = buffer[:end_pos]
+                            _LOGGER.debug("Found message end marker (message size: %d bytes)", len(message_data))
+                            break
+                    
+                    # Safety check for buffer size to prevent memory issues
+                    if len(buffer) > 1024 * 1024:  # 1 MB max
+                        _LOGGER.error("Message buffer too large (>1MB)")
+                        raise ConnectionError("Message too large")
+                
+                # Parse the message
                 try:
-                    length_bytes = await asyncio.wait_for(
-                        self._reader.readexactly(4), timeout=self._connection_timeout
-                    )
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout reading message length")
-                    raise ConnectionError("Timeout reading message length")
-
-                length = int.from_bytes(length_bytes, byteorder="big")
-
-                # Improved sanity check for length to prevent memory issues
-                if length <= 0:
-                    _LOGGER.error(
-                        "Invalid message length: %s bytes (zero or negative)", length
-                    )
-                    raise ConnectionError("Invalid message length (zero or negative)")
-
-                if length > 1024 * 1024:  # 1 MB max
-                    _LOGGER.error(
-                        "Invalid message length: %s bytes (exceeds maximum)", length
-                    )
-                    raise ConnectionError("Invalid message length (exceeds maximum)")
-
-                # Read message data with timeout
-                try:
-                    data = await asyncio.wait_for(
-                        self._reader.readexactly(length),
-                        timeout=self._connection_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout reading message data (%s bytes)", length)
-                    raise ConnectionError(
-                        f"Timeout reading message data ({length} bytes)"
-                    )
-
-                try:
-                    message = json.loads(data.decode("utf-8"))
+                    message = json.loads(message_data.decode("utf-8"))
                 except UnicodeDecodeError as decode_err:
                     _LOGGER.error("Unicode decode error: %s", decode_err)
                     # Log the first 100 bytes of data to help debug
-                    _LOGGER.error("First 100 bytes: %s", data[:100])
+                    _LOGGER.error("First 100 bytes: %s", message_data[:100])
                     raise ConnectionError(f"Unicode decode error: {decode_err}")
                 except json.JSONDecodeError as json_err:
                     _LOGGER.error("JSON decode error: %s", json_err)
                     # Log the first 100 chars of data to help debug
                     _LOGGER.error(
                         "First 100 chars: %s",
-                        data.decode("utf-8", errors="replace")[:100],
+                        message_data.decode("utf-8", errors="replace")[:100],
                     )
                     raise ConnectionError(f"JSON decode error: {json_err}")
 
-                # Log received message but don't handle it here
-                # Heartbeat handling is now done in _handle_message
+                # Log received message
                 message_type = message.get("type", "unknown")
-                _LOGGER.debug("Received message type: %s", message_type)
+                elapsed = time.time() - start_time
+                _LOGGER.debug("Received message type: %s in %.2fs", message_type, elapsed)
+
+                # Update heartbeat timestamp for any successfully received message
+                self._last_heartbeat_received = time.time()
 
                 return message
+                
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timeout reading message (after %ss)", self._READ_TIMEOUT)
+                raise ConnectionError("Timeout reading message")
             except asyncio.IncompleteReadError as incomplete_err:
                 _LOGGER.warning(
                     "Connection closed by server (incomplete read: %s)", incomplete_err
@@ -807,7 +834,7 @@ class YoloProcessingApiClient:
 
     async def _send_message(self, message: Dict[str, Any]) -> bool:
         """
-        Send a message to the server with enhanced reliability and error handling.
+        Send a message to the server using start/end markers for more reliable framing.
 
         Returns:
             bool: True if the message was sent successfully, False on connection errors
@@ -847,11 +874,10 @@ class YoloProcessingApiClient:
                 _LOGGER.error("Failed to encode message to JSON: %s", err)
                 return False
 
-            # Send message length (4 bytes) followed by data
+            # Send with start/end markers instead of length prefix
             try:
-                length = len(data)
-                self._writer.write(length.to_bytes(4, byteorder="big"))
-                self._writer.write(data)
+                # Write start marker + data + end marker
+                self._writer.write(self._MESSAGE_START + data + self._MESSAGE_END)
 
                 # Use timeout for drain to prevent hanging
                 try:
@@ -867,9 +893,10 @@ class YoloProcessingApiClient:
                     return False
 
                 _LOGGER.debug(
-                    "Sent message type=%s to %s",
+                    "Sent message type=%s to %s (%d bytes)",
                     message.get("type", "unknown"),
                     peername,
+                    len(data)
                 )
                 return True
             except ConnectionResetError as conn_err:

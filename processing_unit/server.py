@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Dict, List, Optional, Any, Tuple, Set
+from typing import Dict, List, Optional, Any, Tuple, Set, Union
 
 import cv2
 import numpy as np
@@ -761,9 +761,125 @@ class YoloDetector:
         }
 
 
+# Message start and end markers for framing
+MESSAGE_START_MARKER = b'<<<START>>>'
+MESSAGE_END_MARKER = b'<<<END>>>'
+
+def read_message_from_socket(sock: socket.socket, timeout: int = 30) -> Optional[Dict[str, Any]]:
+    """
+    Read a message from a socket using start/end markers instead of length prefixes.
+    
+    Args:
+        sock: Socket to read from
+        timeout: Timeout in seconds for read operation (default 30s)
+        
+    Returns:
+        Dict or None: Parsed message if successful, None if connection broken
+    """
+    # Save original timeout to restore later
+    original_timeout = None
+    try:
+        original_timeout = sock.gettimeout()
+    except Exception:
+        pass
+    
+    try:
+        # Set timeout for this operation
+        sock.settimeout(timeout)
+        
+        # Read until we find the start marker
+        data = b""
+        start_found = False
+        buffer_size = 1024
+        
+        while not start_found:
+            try:
+                chunk = sock.recv(buffer_size)
+                if not chunk:  # Connection closed
+                    socket_logger.warning("Connection closed while looking for start marker")
+                    return None
+                    
+                data += chunk
+                start_pos = data.find(MESSAGE_START_MARKER)
+                
+                if start_pos >= 0:
+                    # Found start marker, remove everything before it
+                    data = data[start_pos + len(MESSAGE_START_MARKER):]
+                    start_found = True
+                    socket_logger.debug("Found message start marker")
+                
+                # Safety check for buffer size to prevent memory issues
+                if len(data) > 1024 * 1024:  # 1MB max
+                    socket_logger.error("Buffer overflow while looking for start marker")
+                    return None
+            except socket.timeout:
+                socket_logger.warning("Timeout while looking for start marker")
+                return None
+        
+        # Now read until we find the end marker
+        end_found = False
+        message_data = b""
+        
+        while not end_found:
+            end_pos = data.find(MESSAGE_END_MARKER)
+            
+            if end_pos >= 0:
+                # Found end marker, extract the message
+                message_data += data[:end_pos]
+                end_found = True
+                socket_logger.debug(f"Found message end marker (message size: {len(message_data)} bytes)")
+            else:
+                # End marker not found yet, save what we have and read more
+                message_data += data
+                
+                # Read more data
+                try:
+                    chunk = sock.recv(buffer_size)
+                    if not chunk:  # Connection closed
+                        socket_logger.warning("Connection closed while looking for end marker")
+                        return None
+                        
+                    data = chunk
+                    
+                    # Safety check for message size to prevent memory issues
+                    if len(message_data) > 1024 * 1024:  # 1MB max
+                        socket_logger.error("Message too large while looking for end marker")
+                        return None
+                except socket.timeout:
+                    socket_logger.warning("Timeout while looking for end marker")
+                    return None
+        
+        # Parse the message
+        try:
+            json_message = json.loads(message_data.decode("utf-8"))
+            message_type = json_message.get("type", "unknown")
+            socket_logger.debug(f"Successfully parsed message of type: {message_type}")
+            return json_message
+        except json.JSONDecodeError as json_err:
+            socket_logger.warning(f"Invalid JSON in message: {json_err}")
+            return None
+        
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as conn_err:
+        socket_logger.warning(f"Connection error during read: {str(conn_err)}")
+        return None
+    except Exception as ex:
+        socket_logger.error(f"Error reading from socket: {str(ex)}", exc_info=True)
+        return None
+    finally:
+        # Restore original timeout
+        try:
+            if original_timeout is not None:
+                sock.settimeout(original_timeout)
+        except Exception:
+            # If we can't restore the timeout, set a reasonable default
+            try:
+                sock.settimeout(60)  # Default 60s timeout
+            except:
+                pass
+
 def write_message_to_socket(sock: socket.socket, message: Dict[str, Any], restore_timeout: int = 60) -> bool:
     """
-    Write a message to a socket.
+    Write a message to a socket using start/end markers instead of length prefixes.
     
     Args:
         sock: Socket to write to
@@ -801,9 +917,6 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any], restor
         # Convert message to JSON
         json_data = json.dumps(message).encode("utf-8")
         
-        # Prefix with message length (4 bytes)
-        length = len(json_data)
-        
         # Check if disk space is critically low before socket operations
         # This helps avoid errors from disk-full conditions
         if check_disk_space() > 95:  # extremely critical
@@ -811,14 +924,16 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any], restor
             return False
             
         # Use a non-blocking socket with timeout to avoid hangs
-        sock.settimeout(5)  # 5 second timeout
+        sock.settimeout(15)  # 15 second timeout for longer messages
         
-        # Send data in chunks to be safer
+        # Send data with start/end markers
         try:
-            # Send length prefix
-            sock.sendall(length.to_bytes(4, byteorder="big"))
-            # Send message data
-            sock.sendall(json_data)
+            # Create the framed message: START_MARKER + json_data + END_MARKER
+            framed_message = MESSAGE_START_MARKER + json_data + MESSAGE_END_MARKER
+            
+            # Send the full framed message
+            sock.sendall(framed_message)
+            
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as conn_err:
             socket_logger.warning(f"Connection error during send: {str(conn_err)}")
             return False
@@ -836,7 +951,7 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any], restor
             log_message["state"] = f"[State data with {len(str(log_message['state']))} chars]"
         
         # Enhanced logging for better visibility
-        socket_logger.info(f"SENT to client: type={message_type}, detector={detector_id}")
+        socket_logger.info(f"SENT to client: type={message_type}, detector={detector_id}, size={len(json_data)} bytes")
         socket_logger.debug(f"SENT message details: {log_message}")
         
         return True
@@ -898,52 +1013,18 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
             
         # Read client's authentication message
         socket_logger.debug(f"Waiting for authentication message from client {addr}")
-        try:
-            # Read message length with timeout
-            length_data = sock.recv(4)
-            if not length_data or len(length_data) < 4:
-                socket_logger.warning(f"Client {addr} disconnected during authentication (invalid length prefix)")
-                return
-                
-            length = int.from_bytes(length_data, byteorder="big")
-            
-            # Sanity check message length
-            if length <= 0 or length > 1024 * 1024:  # Max 1MB
-                socket_logger.warning(f"Invalid message length {length} from client {addr}")
-                return
-                
-            socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
-            
-            # Read message data with timeout
-            data = b""
-            remaining = length
-            
-            while remaining > 0:
-                chunk = sock.recv(min(remaining, 8192))  # Read in chunks
-                if not chunk:  # Connection closed
-                    socket_logger.warning(f"Connection closed by client {addr} during read")
-                    return
-                data += chunk
-                remaining -= len(chunk)
-                
-        except socket.timeout:
-            socket_logger.warning(f"Timeout receiving authentication from client {addr}")
+        message = read_message_from_socket(sock, timeout=30)
+        if message is None:
+            socket_logger.warning(f"Failed to read authentication message from client {addr}")
             return
-        except (ConnectionResetError, BrokenPipeError, OSError) as conn_err:
-            socket_logger.warning(f"Connection error during authentication from client {addr}: {conn_err}")
-            return
-        
+
         try:
-            message = json.loads(data.decode("utf-8"))
             message_type = message.get("type", "unknown")
             detector_id = message.get("detector_id", "none")
             socket_logger.info(f"RECEIVED from client {addr}: type={message_type}, detector={detector_id}")
             socket_logger.debug(f"RECEIVED message details: {message}")
-        except json.JSONDecodeError:
-            socket_logger.warning(f"Invalid JSON from client {addr}: {data}")
-            return
         except Exception as decode_ex:
-            socket_logger.warning(f"Error decoding message from client {addr}: {decode_ex}")
+            socket_logger.warning(f"Error processing message from client {addr}: {decode_ex}")
             return
         
         if message.get("type") != "auth":
@@ -1013,42 +1094,13 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
         # Enter main loop
         while True:
             # Wait for client message
-            try:
-                socket_logger.debug(f"Waiting for next message from client {addr}")
-                length_data = sock.recv(4)
-                if not length_data or len(length_data) < 4:
-                    socket_logger.debug(f"Client {addr} disconnected (invalid length prefix)")
-                    break
-                    
-                length = int.from_bytes(length_data, byteorder="big")
-                
-                # Sanity check message length
-                if length <= 0 or length > 1024 * 1024:  # Max 1MB
-                    socket_logger.warning(f"Invalid message length {length} from client {addr}")
-                    break
-                    
-                socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
-                
-                # Read message data with timeout
-                data = b""
-                remaining = length
-                
-                while remaining > 0:
-                    chunk = sock.recv(min(remaining, 8192))  # Read in chunks
-                    if not chunk:  # Connection closed
-                        socket_logger.warning(f"Connection closed by client {addr} during read")
-                        return
-                    data += chunk
-                    remaining -= len(chunk)
-            except socket.timeout:
-                socket_logger.warning(f"Timeout receiving message from client {addr}")
-                break
-            except (ConnectionResetError, BrokenPipeError, OSError) as conn_err:
-                socket_logger.warning(f"Connection error receiving message from client {addr}: {conn_err}")
+            socket_logger.debug(f"Waiting for next message from client {addr}")
+            message = read_message_from_socket(sock, timeout=60)
+            if message is None:
+                socket_logger.warning(f"Failed to read message from client {addr}")
                 break
             
             try:
-                message = json.loads(data.decode("utf-8"))
                 message_type = message.get("type", "unknown")
                 message_detector_id = message.get("detector_id", "none")
                 socket_logger.info(f"RECEIVED message from client {addr}: type={message_type}, detector={message_detector_id}")
@@ -1057,11 +1109,8 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
                 # Update detector_id if it was provided in the message
                 if message_detector_id and message_detector_id != "none":
                     detector_id = message_detector_id
-            except json.JSONDecodeError:
-                socket_logger.warning(f"Invalid JSON from client {addr}: {data}")
-                continue
             except Exception as decode_ex:
-                socket_logger.warning(f"Error decoding message from client {addr}: {decode_ex}")
+                socket_logger.warning(f"Error processing message from client {addr}: {decode_ex}")
                 continue
             
             # Process message based on type
