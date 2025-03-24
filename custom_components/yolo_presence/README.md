@@ -98,11 +98,27 @@ The integration fires the following events:
 | Name | Name of the camera instance | YOLO Presence |
 | Processing Server | URL of the YOLO processing server | http://localhost:5000 |
 | Stream URL | RTSP URL of the camera | Required |
+| Auto-Optimization | Enable automatic resource optimization | Disabled |
 | Model | YOLO model to use | YOLOv11L |
 | Detection Interval | Seconds between detections | 5s (GPU), 10s (CPU) |
 | Confidence Threshold | Minimum detection confidence (0.1-0.9) | 0.25 |
 | Input Resolution | Resolution for processing | 640x480 |
 | Frame Skip Rate | Process 1 out of X frames | 3 (GPU), 5 (CPU) |
+
+### Auto-Optimization
+
+The integration includes an automatic resource optimization feature that:
+
+- Automatically adjusts detection settings based on server resource usage
+- Dynamically selects the optimal model, resolution, and frame rate
+- Monitors CPU, memory, and GPU usage in real-time
+- Scales back resource usage when the server is under heavy load
+- Improves performance automatically when resources are available
+
+When auto-optimization is enabled:
+- Manual configuration fields for model, interval, resolution, etc. are disabled
+- The server continuously monitors resource usage and adjusts settings
+- Optimization happens transparently without disrupting detection
 
 ## Hardware Requirements
 

@@ -3,19 +3,11 @@
 import asyncio
 import json
 import logging
-import socket
 import time
-from typing import Dict, Any, Optional, List, Callable, Tuple
-import aiohttp
-from aiohttp.client_exceptions import (
-    ClientConnectorError,
-    ClientError,
-    ClientPayloadError,
-)
+from typing import Dict, Any, Optional, Callable
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.util.dt as dt_util
-from .const import ATTR_DEVICE_ID, CONF_PROCESSING_SERVER_PORT
+from .const import ATTR_DEVICE_ID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1037,6 +1029,13 @@ class YoloProcessingApiClient:
             # Store config
             self._config = config
 
+            # Check if auto-optimization is enabled
+            use_auto_optimization = config.get("use_auto_optimization", False)
+            if use_auto_optimization:
+                _LOGGER.info(
+                    "Auto-optimization enabled: Detection settings will be managed by server"
+                )
+
             # Connect to the processing server
             connected = await self.async_connect()
             if not connected:
@@ -1052,6 +1051,7 @@ class YoloProcessingApiClient:
                     "type": "create_detector",
                     "detector_id": self.detector_id,
                     "config": config,
+                    "use_auto_optimization": use_auto_optimization,
                 }
                 if not await self._send_message(create_message):
                     _LOGGER.error(
@@ -1069,7 +1069,10 @@ class YoloProcessingApiClient:
                     self._reconnect_event.set()
                     return False
 
-                _LOGGER.info("Detector created successfully on server")
+                _LOGGER.info(
+                    "Detector created successfully on server%s",
+                    " with auto-optimization enabled" if use_auto_optimization else "",
+                )
             except Exception as create_ex:
                 _LOGGER.error("Failed to create detector on server: %s", create_ex)
                 # Continue anyway - the connection is established
