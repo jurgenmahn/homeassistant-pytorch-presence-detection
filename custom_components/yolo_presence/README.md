@@ -62,7 +62,7 @@ The integration can be configured through the Home Assistant UI:
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for "YOLO Presence" and select it
-3. Enter the processing server URL (e.g., http://192.168.1.100:5000)
+3. Enter the processing server URL (e.g., http://192.168.1.100:5505)
 4. Enter the RTSP stream URL of your camera
 5. Configure optional parameters like detection interval, model, etc.
 
@@ -96,7 +96,7 @@ The integration fires the following events:
 | Option | Description | Default |
 |--------|-------------|---------|
 | Name | Name of the camera instance | YOLO Presence |
-| Processing Server | URL of the YOLO processing server | http://localhost:5000 |
+| Processing Server | URL of the YOLO processing server | http://localhost:5505 |
 | Stream URL | RTSP URL of the camera | Required |
 | Auto-Optimization | Enable automatic resource optimization | Disabled |
 | Model | YOLO model to use | YOLOv11L |

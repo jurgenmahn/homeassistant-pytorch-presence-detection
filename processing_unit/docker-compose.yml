@@ -8,11 +8,11 @@ services:
     container_name: yolo-presence-server
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5505:5505"
     volumes:
       - "../models:/app/models"  # Mount models directory for access to YOLO models
     environment:
-      - TCP_PORT=5000
+      - TCP_PORT=5505
       - DEBUG=false
     deploy:
       resources:

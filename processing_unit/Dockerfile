@@ -20,7 +20,7 @@ COPY . .
 RUN mkdir -p /app/models
 
 # Expose the TCP socket port
-EXPOSE 5000
+EXPOSE 5505
 
 # Create a startup script
 RUN echo '#!/bin/bash\n\

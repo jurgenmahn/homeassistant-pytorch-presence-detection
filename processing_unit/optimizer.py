@@ -163,13 +163,13 @@ class ResourceOptimizer:
         
         # Model suggestions based on complexity
         if model_complexity == "minimal":
-            return "yolov8n"  # Nano model
+            return "yolo11n"  # Nano model
         elif model_complexity == "light":
-            return "yolov8s"  # Small model
+            return "yolo11s"  # Small model
         elif model_complexity == "medium":
-            return "yolov8m"  # Medium model
+            return "yolo11m"  # Medium model
         else:
-            return "yolov8l"  # Large model
+            return "yolo11l"  # Large model
     
     def optimize_memory_usage(self):
         """Perform immediate memory optimization."""

@@ -48,7 +48,7 @@ detector_logger = get_logger("detector")
 socket_logger = get_logger("socket")
 
 # Socket server
-TCP_PORT = int(os.environ.get("TCP_PORT", 5000))
+TCP_PORT = int(os.environ.get("TCP_PORT", 5505))
 socket_server = None
 socket_clients = {}  # Maps detector_id to set of socket connections
 

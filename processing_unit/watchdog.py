@@ -381,7 +381,7 @@ class SocketWatchdog:
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 5000,
+        port: int = 5505,
         check_interval: int = 30,  # seconds
         max_failures: int = 3,
         restart_delay: int = 5,  # seconds
@@ -732,7 +732,7 @@ def start_watchdog(enable_socket_watchdog=True):
     if enable_socket_watchdog:
         # Get server host/port 
         host = os.environ.get("SERVER_HOST", "0.0.0.0")
-        port = int(os.environ.get("SERVER_PORT", "5000"))
+        port = int(os.environ.get("SERVER_PORT", "5505"))
         
         # For watchdog connections, we use localhost even if server binds to 0.0.0.0
         watchdog_host = "localhost" if host == "0.0.0.0" else host

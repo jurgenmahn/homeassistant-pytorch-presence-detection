@@ -29,7 +29,7 @@ cd processing_unit
 docker-compose up -d
 ```
 
-The server will be available at http://localhost:5000.
+The server will be available at http://localhost:5505.
 
 ## API Endpoints
 
@@ -43,14 +43,14 @@ The server will be available at http://localhost:5000.
 ## Usage with Home Assistant
 
 1. Install the YOLO Presence Detection integration in Home Assistant
-2. When adding a new device, set the processing server URL to `http://<your-server-ip>:5000`
+2. When adding a new device, set the processing server URL to `http://<your-server-ip>:5505`
 3. Configure the remaining options as needed
 
 ## Configuration
 
 The following environment variables can be set in the `docker-compose.yml` file:
 
-- `PORT`: The port to run the server on (default: 5000)
+- `PORT`: The port to run the server on (default: 5505)
 - `DEBUG`: Enable debug mode (default: false)
 
 ## Troubleshooting

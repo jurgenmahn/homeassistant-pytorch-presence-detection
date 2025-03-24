@@ -50,7 +50,7 @@ async def validate_processing_server(
 
     try:
         # Get port from config or use default
-        port = hass.data.get("port", 5000)
+        port = hass.data.get("port", 5505)
 
         # Try to establish a connection to check if the server is reachable
         future = asyncio.open_connection(server_host, port)

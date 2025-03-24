@@ -21,7 +21,7 @@ class YoloProcessingApiClient:
         hass: HomeAssistant,
         server_url: str = None,
         host: str = None,
-        port: int = 5000,
+        port: int = 5505,
         detector_id: str = None,
         update_interval: int = 30,
         server_port: int = None,
