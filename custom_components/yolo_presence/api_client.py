@@ -900,26 +900,41 @@ class YoloProcessingApiClient:
         """Handle a message from the server."""
         message_type = message.get("type")
 
+        # Always update heartbeat timestamps - any message means connection is alive
+        self._last_heartbeat_received = time.time()
+        self._heartbeat_missed_count = 0
+
         if message_type == "state_update":
-            # Any message from the server, including state updates, should reset heartbeat monitoring
-            self._last_heartbeat_received = time.time()
-            self._heartbeat_missed_count = 0
+            # Handle state updates
             await self._handle_state_update(message)
-        elif message_type == "heartbeat":
-            # Record that we received a heartbeat
-            self._last_heartbeat_received = time.time()
-            self._heartbeat_missed_count = 0
-            _LOGGER.debug("Received heartbeat from server, connection is healthy")
+        elif message_type == "heartbeat" or message_type == "heartbeat_response":
+            # Record that we received a heartbeat or heartbeat response
+            _LOGGER.debug(
+                "Received %s from server, connection is healthy", message_type
+            )
+        elif message_type == "keepalive":
+            # Handle keepalive messages - just log them
+            _LOGGER.debug(
+                "Received keepalive from server (timestamp: %s)",
+                message.get("server_timestamp", "none"),
+            )
+        elif message_type == "detector_not_found":
+            # This happens when the server doesn't have our detector registered
+            # The next get_state or other operation should trigger recreation
+            _LOGGER.info(
+                "Server reports detector not found, will be recreated on next check"
+            )
         elif message_type == "error":
-            # Even errors indicate the connection is working
-            self._last_heartbeat_received = time.time()
+            # Log errors from server
             _LOGGER.error(
                 "Error from server: %s", message.get("message", "Unknown error")
             )
+        elif message_type == "auth_success":
+            # Auth was successful, connection established
+            _LOGGER.debug("Authentication successful")
         else:
-            # Any message received means the connection is alive
-            self._last_heartbeat_received = time.time()
-            _LOGGER.warning("Unknown message type: %s", message_type)
+            # Unknown message types - just log them but don't treat as errors
+            _LOGGER.debug("Received message with type: %s", message_type)
 
     async def _handle_state_update(self, message: Dict[str, Any]) -> None:
         """Handle a state update message."""
