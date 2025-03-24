@@ -768,14 +768,51 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any]) -> boo
     Returns:
         bool: True if successful, False if connection broken
     """
+    # First validate the socket is valid
+    if sock is None:
+        socket_logger.warning("Cannot send message to None socket")
+        return False
+        
+    # Check socket validity
+    try:
+        # Check if socket is closed or invalid
+        # This doesn't guarantee the socket is valid, but helps catch some cases
+        sock.getpeername()
+    except OSError:
+        socket_logger.warning("Socket appears to be invalid (getpeername failed)")
+        return False
+    except Exception as ex:
+        socket_logger.warning(f"Socket validation failed: {str(ex)}")
+        return False
+        
     try:
         # Convert message to JSON
         json_data = json.dumps(message).encode("utf-8")
         
         # Prefix with message length (4 bytes)
         length = len(json_data)
-        sock.sendall(length.to_bytes(4, byteorder="big"))
-        sock.sendall(json_data)
+        
+        # Check if disk space is critically low before socket operations
+        # This helps avoid errors from disk-full conditions
+        if check_disk_space() > 95:  # extremely critical
+            socket_logger.error("Disk space critically low (>95%), cannot reliably send messages")
+            return False
+            
+        # Use a non-blocking socket with timeout to avoid hangs
+        sock.settimeout(5)  # 5 second timeout
+        
+        # Send data in chunks to be safer
+        try:
+            # Send length prefix
+            sock.sendall(length.to_bytes(4, byteorder="big"))
+            # Send message data
+            sock.sendall(json_data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as conn_err:
+            socket_logger.warning(f"Connection error during send: {str(conn_err)}")
+            return False
+        except socket.timeout:
+            socket_logger.warning("Socket send operation timed out")
+            return False
         
         # Log the message being sent
         message_type = message.get("type", "unknown")
@@ -798,9 +835,18 @@ def write_message_to_socket(sock: socket.socket, message: Dict[str, Any]) -> boo
     except ConnectionResetError:
         socket_logger.warning(f"Connection reset by client when sending {message.get('type', 'unknown')}")
         return False
+    except OSError as os_err:
+        socket_logger.warning(f"OS error during socket operation: {str(os_err)}")
+        return False
     except Exception as ex:
         socket_logger.error(f"Error writing to socket: {str(ex)}", exc_info=True)
         return False
+    finally:
+        # Reset timeout to default
+        try:
+            sock.settimeout(None)
+        except:
+            pass
 
 
 def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None:
@@ -809,17 +855,63 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
     socket_logger.debug("Debug logging is enabled for socket connections")
     detector_id = None
     
+    # Set socket timeout to prevent hangs
     try:
+        sock.settimeout(30)  # 30 second timeout for initial authentication
+    except Exception as timeout_ex:
+        socket_logger.warning(f"Failed to set socket timeout: {timeout_ex}")
+    
+    try:
+        # Check disk space before accepting new connections
+        if check_disk_space() > 95:  # extremely critical
+            socket_logger.error(f"Disk space critically low, refusing client connection from {addr}")
+            try:
+                error_msg = {"type": "error", "message": "Server disk space critical, please try again later"}
+                json_data = json.dumps(error_msg).encode("utf-8")
+                length = len(json_data)
+                sock.sendall(length.to_bytes(4, byteorder="big"))
+                sock.sendall(json_data)
+                sock.close()
+            except:
+                pass
+            return
+            
         # Read client's authentication message
         socket_logger.debug(f"Waiting for authentication message from client {addr}")
-        length_data = sock.recv(4)
-        if not length_data:
-            socket_logger.warning(f"Client {addr} disconnected during authentication")
+        try:
+            # Read message length with timeout
+            length_data = sock.recv(4)
+            if not length_data or len(length_data) < 4:
+                socket_logger.warning(f"Client {addr} disconnected during authentication (invalid length prefix)")
+                return
+                
+            length = int.from_bytes(length_data, byteorder="big")
+            
+            # Sanity check message length
+            if length <= 0 or length > 1024 * 1024:  # Max 1MB
+                socket_logger.warning(f"Invalid message length {length} from client {addr}")
+                return
+                
+            socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
+            
+            # Read message data with timeout
+            data = b""
+            remaining = length
+            
+            while remaining > 0:
+                chunk = sock.recv(min(remaining, 8192))  # Read in chunks
+                if not chunk:  # Connection closed
+                    socket_logger.warning(f"Connection closed by client {addr} during read")
+                    return
+                data += chunk
+                remaining -= len(chunk)
+                
+        except socket.timeout:
+            socket_logger.warning(f"Timeout receiving authentication from client {addr}")
             return
-        
-        length = int.from_bytes(length_data, byteorder="big")
-        socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
-        data = sock.recv(length)
+        except (ConnectionResetError, BrokenPipeError, OSError) as conn_err:
+            socket_logger.warning(f"Connection error during authentication from client {addr}: {conn_err}")
+            return
         
         try:
             message = json.loads(data.decode("utf-8"))
@@ -829,6 +921,9 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
             socket_logger.debug(f"RECEIVED message details: {message}")
         except json.JSONDecodeError:
             socket_logger.warning(f"Invalid JSON from client {addr}: {data}")
+            return
+        except Exception as decode_ex:
+            socket_logger.warning(f"Error decoding message from client {addr}: {decode_ex}")
             return
         
         if message.get("type") != "auth":
@@ -856,182 +951,260 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
         with detector_lock:
             if detector_id not in socket_clients:
                 socket_clients[detector_id] = set()
+            
+            # Remove any dead connections with the same socket address
+            to_remove = set()
+            for existing_sock in socket_clients[detector_id]:
+                try:
+                    # Try to get peer name - will fail if socket is dead
+                    existing_sock.getpeername()
+                except:
+                    to_remove.add(existing_sock)
+            
+            # Remove dead connections
+            for dead_sock in to_remove:
+                socket_clients[detector_id].discard(dead_sock)
+                try:
+                    dead_sock.close()
+                except:
+                    pass
+                
+            # Add new connection
             socket_clients[detector_id].add(sock)
         
+        # Set a longer timeout for established connection
+        try:
+            sock.settimeout(60)  # 60 second timeout for normal operation
+        except Exception as timeout_ex:
+            socket_logger.warning(f"Failed to set socket timeout: {timeout_ex}")
+            
         # Enter main loop
         while True:
             # Wait for client message
-            socket_logger.debug(f"Waiting for next message from client {addr}")
-            length_data = sock.recv(4)
-            if not length_data:
-                socket_logger.debug(f"Client {addr} disconnected")
-                break
+            try:
+                socket_logger.debug(f"Waiting for next message from client {addr}")
+                length_data = sock.recv(4)
+                if not length_data or len(length_data) < 4:
+                    socket_logger.debug(f"Client {addr} disconnected (invalid length prefix)")
+                    break
+                    
+                length = int.from_bytes(length_data, byteorder="big")
                 
-            length = int.from_bytes(length_data, byteorder="big")
-            socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
-            data = sock.recv(length)
+                # Sanity check message length
+                if length <= 0 or length > 1024 * 1024:  # Max 1MB
+                    socket_logger.warning(f"Invalid message length {length} from client {addr}")
+                    break
+                    
+                socket_logger.debug(f"Received message length: {length} bytes from client {addr}")
+                
+                # Read message data with timeout
+                data = b""
+                remaining = length
+                
+                while remaining > 0:
+                    chunk = sock.recv(min(remaining, 8192))  # Read in chunks
+                    if not chunk:  # Connection closed
+                        socket_logger.warning(f"Connection closed by client {addr} during read")
+                        return
+                    data += chunk
+                    remaining -= len(chunk)
+            except socket.timeout:
+                socket_logger.warning(f"Timeout receiving message from client {addr}")
+                break
+            except (ConnectionResetError, BrokenPipeError, OSError) as conn_err:
+                socket_logger.warning(f"Connection error receiving message from client {addr}: {conn_err}")
+                break
             
             try:
                 message = json.loads(data.decode("utf-8"))
                 message_type = message.get("type", "unknown")
-                detector_id = message.get("detector_id", "none")
-                socket_logger.info(f"RECEIVED message from client {addr}: type={message_type}, detector={detector_id}")
+                message_detector_id = message.get("detector_id", "none")
+                socket_logger.info(f"RECEIVED message from client {addr}: type={message_type}, detector={message_detector_id}")
                 socket_logger.debug(f"RECEIVED message details: {message}")
+                
+                # Update detector_id if it was provided in the message
+                if message_detector_id and message_detector_id != "none":
+                    detector_id = message_detector_id
             except json.JSONDecodeError:
                 socket_logger.warning(f"Invalid JSON from client {addr}: {data}")
                 continue
+            except Exception as decode_ex:
+                socket_logger.warning(f"Error decoding message from client {addr}: {decode_ex}")
+                continue
             
-            message_type = message.get("type", "unknown")
-            
-            if message_type == "heartbeat":
-                # Respond with heartbeat
-                response = {"type": "heartbeat"}
-                write_message_to_socket(sock, response)
+            # Process message based on type
+            try:
+                message_type = message.get("type", "unknown")
                 
-            elif message_type == "get_state":
-                # Send current detector state
-                socket_logger.info(f"Received get_state request from client {addr} for detector {detector_id}")
-                
-                with detector_lock:
-                    if detector_id in detectors:
-                        detector = detectors[detector_id]
-                        socket_logger.info(f"Found detector {detector_id}, checking state...")
-                        
-                        # Explicitly log detector properties
-                        socket_logger.info(f"Detector {detector_id} availability: stream_url={detector.stream_url}, is_running={detector.is_running}")
-                        socket_logger.info(f"Detector {detector_id} detection state: people_detected={detector.people_detected}, pets_detected={detector.pets_detected}")
-                        socket_logger.info(f"Detector {detector_id} counts: people_count={detector.people_count}, pet_count={detector.pet_count}")
-                        
-                        # Log stream status without capturing test frames to improve performance
-                        if detector.cap is not None and detector.cap.isOpened():
-                            socket_logger.info(f"Stream appears to be open for detector {detector_id}")
-                            
-                            # Uncomment the following code to re-enable test frame capture for debugging
-                            # try:
-                            #     socket_logger.info(f"Testing frame capture for detector {detector_id}...")
-                            #     ret, test_frame = detector.cap.read()
-                            #     if ret and test_frame is not None:
-                            #         socket_logger.info(f"Successfully captured test frame: {test_frame.shape}")
-                            #         # Save test frame
-                            #         test_path = os.path.join(detector.debug_frames_dir, f"test_frame_requested_{int(time.time())}.jpg")
-                            #         cv2.imwrite(test_path, test_frame)
-                            #         socket_logger.info(f"Saved test frame to {test_path}")
-                            #     else:
-                            #         socket_logger.warning(f"Failed to capture test frame for detector {detector_id}")
-                            # except Exception as ex:
-                            #     socket_logger.error(f"Error testing frame capture: {ex}")
-                        else:
-                            socket_logger.warning(f"No valid capture device for detector {detector_id}")
-                        
-                        state = detector.get_state()
-                        response = {
-                            "type": "state_update",
-                            "detector_id": detector_id,
-                            "state": {
-                                "human_detected": detector.people_detected,
-                                "pet_detected": detector.pets_detected,
-                                "human_count": detector.people_count,
-                                "pet_count": detector.pet_count,
-                                "last_update": time.time(),
-                                "connection_status": detector.connection_status,
-                            }
-                        }
-                        if not write_message_to_socket(sock, response):
-                            socket_logger.warning(f"Connection lost with client {addr} while sending state update")
-                            break
-                    else:
-                        # Create detector if it doesn't exist
-                        response = {
-                            "type": "detector_not_found",
-                            "detector_id": detector_id
-                        }
-                        if not write_message_to_socket(sock, response):
-                            socket_logger.warning(f"Connection lost with client {addr} while sending detector_not_found")
-                            break
-                        
-            elif message_type == "create_detector":
-                # Create new detector
-                config = message.get("config", {})
-                
-                socket_logger.info(f"Processing create_detector request for detector_id={detector_id}")
-                socket_logger.debug(f"Detector config: {config}")
-                
-                with detector_lock:
-                    if detector_id in detectors:
-                        # Detector already exists, update config
-                        detector = detectors[detector_id]
-                        socket_logger.info(f"Updating existing detector {detector_id}")
-                        
-                        # Update detector configuration
-                        if config.get("stream_url"):
-                            detector.stream_url = config["stream_url"]
-                        if config.get("name"):
-                            detector.name = config["name"]
-                        if config.get("model"):
-                            # Model changes require reinitialization, which we'll skip here
-                            # Just update the field but don't reload the model
-                            detector.model_name = config["model"]
-                        if config.get("input_size"):
-                            try:
-                                width, height = map(int, config["input_size"].split("x"))
-                                detector.input_width = width
-                                detector.input_height = height
-                            except:
-                                pass
-                        if config.get("detection_interval"):
-                            detector.detection_interval = config["detection_interval"]
-                        if config.get("confidence_threshold"):
-                            detector.confidence_threshold = config["confidence_threshold"]
-                        if config.get("frame_skip_rate"):
-                            detector.frame_skip_rate = config["frame_skip_rate"]
-                        
-                        # Save the updated configuration
-                        socket_logger.info(f"Saving updated configuration for detector {detector_id}")
-                        save_detectors_config()
-                        response = {"type": "detector_updated", "detector_id": detector_id}
-                    else:
-                        # Create new detector
-                        socket_logger.info(f"Creating new detector {detector_id}")
-                        detector = YoloDetector(detector_id, config)
-                        
-                        # Log detector details before initialization
-                        socket_logger.info(f"New detector details: stream_url={config.get('stream_url')}, name={config.get('name')}, model={config.get('model')}")
-                        
-                        if detector.initialize():
-                            detectors[detector_id] = detector
-                            # Save detector configuration when a new detector is created
-                            socket_logger.info(f"Successfully initialized detector {detector_id}, saving configuration")
-                            # Immediately save the configuration to ensure it's persisted
-                            save_detectors_config()
-                            # Verify the configuration was saved correctly
-                            try:
-                                if os.path.exists(DETECTORS_CONFIG_FILE):
-                                    with open(DETECTORS_CONFIG_FILE, "r") as f:
-                                        config_content = f.read()
-                                        socket_logger.info(f"Verified detector config file contains: {config_content}")
-                                else:
-                                    socket_logger.error(f"Config file not found after saving: {DETECTORS_CONFIG_FILE}")
-                                    # Attempt to save again
-                                    save_detectors_config()
-                            except Exception as verify_ex:
-                                socket_logger.error(f"Error verifying saved configuration: {str(verify_ex)}", exc_info=True)
-                            
-                            response = {"type": "detector_created", "detector_id": detector_id}
-                        else:
-                            socket_logger.error(f"Failed to initialize detector {detector_id}")
-                            response = {"type": "error", "message": "Failed to initialize detector"}
-                            
+                if message_type == "heartbeat":
+                    # Respond with heartbeat
+                    response = {"type": "heartbeat"}
                     if not write_message_to_socket(sock, response):
-                        socket_logger.warning(f"Connection lost with client {addr} while sending detector create/update response")
+                        socket_logger.warning(f"Failed to send heartbeat response to client {addr}")
                         break
                     
-            else:
-                socket_logger.warning(f"Unknown message type: {message_type} from client {addr}")
+                elif message_type == "get_state":
+                    # Send current detector state
+                    socket_logger.info(f"Received get_state request from client {addr} for detector {detector_id}")
+                    
+                    with detector_lock:
+                        if detector_id in detectors:
+                            detector = detectors[detector_id]
+                            socket_logger.info(f"Found detector {detector_id}, checking state...")
+                            
+                            # Explicitly log detector properties
+                            socket_logger.info(f"Detector {detector_id} availability: stream_url={detector.stream_url}, is_running={detector.is_running}")
+                            socket_logger.info(f"Detector {detector_id} detection state: people_detected={detector.people_detected}, pets_detected={detector.pets_detected}")
+                            socket_logger.info(f"Detector {detector_id} counts: people_count={detector.people_count}, pet_count={detector.pet_count}")
+                            
+                            # Check stream status but don't attempt to read frames
+                            if detector.cap is not None and detector.cap.isOpened():
+                                socket_logger.info(f"Stream appears to be open for detector {detector_id}")
+                            else:
+                                socket_logger.warning(f"No valid capture device for detector {detector_id}")
+                            
+                            # Get state and send response
+                            try:
+                                state = detector.get_state()
+                                response = {
+                                    "type": "state_update",
+                                    "detector_id": detector_id,
+                                    "state": {
+                                        "human_detected": detector.people_detected,
+                                        "pet_detected": detector.pets_detected,
+                                        "human_count": detector.people_count,
+                                        "pet_count": detector.pet_count,
+                                        "last_update": time.time(),
+                                        "connection_status": detector.connection_status,
+                                    }
+                                }
+                                if not write_message_to_socket(sock, response):
+                                    socket_logger.warning(f"Connection lost with client {addr} while sending state update")
+                                    break
+                            except Exception as state_ex:
+                                socket_logger.error(f"Error getting detector state: {state_ex}")
+                                response = {"type": "error", "message": "Error retrieving detector state"}
+                                if not write_message_to_socket(sock, response):
+                                    break
+                        else:
+                            # Detector not found - Send notification
+                            response = {
+                                "type": "detector_not_found",
+                                "detector_id": detector_id
+                            }
+                            if not write_message_to_socket(sock, response):
+                                socket_logger.warning(f"Connection lost with client {addr} while sending detector_not_found")
+                                break
+                            
+                elif message_type == "create_detector":
+                    # Check disk space before creating detector (which generates a lot of files)
+                    if check_disk_space() > 90:
+                        socket_logger.warning(f"Disk space critically low, refusing to create detector for client {addr}")
+                        response = {"type": "error", "message": "Server disk space critical, cannot create detector"}
+                        if not write_message_to_socket(sock, response):
+                            break
+                        continue
+                    
+                    # Create new detector
+                    config = message.get("config", {})
+                    
+                    socket_logger.info(f"Processing create_detector request for detector_id={detector_id}")
+                    socket_logger.debug(f"Detector config: {config}")
+                    
+                    with detector_lock:
+                        if detector_id in detectors:
+                            # Detector already exists, update config
+                            detector = detectors[detector_id]
+                            socket_logger.info(f"Updating existing detector {detector_id}")
+                            
+                            # Update detector configuration
+                            if config.get("stream_url"):
+                                detector.stream_url = config["stream_url"]
+                            if config.get("name"):
+                                detector.name = config["name"]
+                            if config.get("model"):
+                                # Model changes require reinitialization, which we'll skip here
+                                # Just update the field but don't reload the model
+                                detector.model_name = config["model"]
+                            if config.get("input_size"):
+                                try:
+                                    width, height = map(int, config["input_size"].split("x"))
+                                    detector.input_width = width
+                                    detector.input_height = height
+                                except:
+                                    pass
+                            if config.get("detection_interval"):
+                                detector.detection_interval = config["detection_interval"]
+                            if config.get("confidence_threshold"):
+                                detector.confidence_threshold = config["confidence_threshold"]
+                            if config.get("frame_skip_rate"):
+                                detector.frame_skip_rate = config["frame_skip_rate"]
+                            
+                            # Save the updated configuration - only if disk space allows
+                            if check_disk_space() < 90:
+                                socket_logger.info(f"Saving updated configuration for detector {detector_id}")
+                                save_detectors_config()
+                            else:
+                                socket_logger.warning("Skipping config save due to low disk space")
+                                
+                            response = {"type": "detector_updated", "detector_id": detector_id}
+                        else:
+                            # Create new detector
+                            socket_logger.info(f"Creating new detector {detector_id}")
+                            detector = YoloDetector(detector_id, config)
+                            
+                            # Log detector details before initialization
+                            socket_logger.info(f"New detector details: stream_url={config.get('stream_url')}, name={config.get('name')}, model={config.get('model')}")
+                            
+                            if detector.initialize():
+                                detectors[detector_id] = detector
+                                # Save detector configuration when a new detector is created - if disk space allows
+                                socket_logger.info(f"Successfully initialized detector {detector_id}, saving configuration")
+                                
+                                if check_disk_space() < 90:
+                                    # Immediately save the configuration to ensure it's persisted
+                                    save_detectors_config()
+                                    # Verify the configuration was saved correctly
+                                    try:
+                                        if os.path.exists(DETECTORS_CONFIG_FILE):
+                                            with open(DETECTORS_CONFIG_FILE, "r") as f:
+                                                config_content = f.read()
+                                                socket_logger.info(f"Verified detector config file contains: {config_content}")
+                                        else:
+                                            socket_logger.error(f"Config file not found after saving: {DETECTORS_CONFIG_FILE}")
+                                            # Attempt to save again
+                                            save_detectors_config()
+                                    except Exception as verify_ex:
+                                        socket_logger.error(f"Error verifying saved configuration: {str(verify_ex)}", exc_info=True)
+                                else:
+                                    socket_logger.warning("Skipping config save due to low disk space")
+                                
+                                response = {"type": "detector_created", "detector_id": detector_id}
+                            else:
+                                socket_logger.error(f"Failed to initialize detector {detector_id}")
+                                response = {"type": "error", "message": "Failed to initialize detector"}
+                                
+                        if not write_message_to_socket(sock, response):
+                            socket_logger.warning(f"Connection lost with client {addr} while sending detector create/update response")
+                            break
+                        
+                else:
+                    socket_logger.warning(f"Unknown message type: {message_type} from client {addr}")
+                    
+            except Exception as process_ex:
+                socket_logger.error(f"Error processing message from client {addr}: {process_ex}", exc_info=True)
+                # Don't exit the loop on a processing error unless it's critical
+                if isinstance(process_ex, (OSError, BrokenPipeError, ConnectionResetError)):
+                    break
                 
     except ConnectionResetError:
         socket_logger.debug(f"Connection reset by client {addr}")
     except BrokenPipeError:
         socket_logger.debug(f"Connection broken with client {addr}")
+    except socket.timeout:
+        socket_logger.debug(f"Connection timed out for client {addr}")
+    except OSError as os_err:
+        socket_logger.debug(f"Socket error for client {addr}: {os_err}")
     except Exception as ex:
         socket_logger.error(f"Error handling client {addr}: {str(ex)}", exc_info=True)
     finally:
@@ -1047,10 +1220,10 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
                 if sock in socket_clients[detector_id]:
                     socket_clients[detector_id].remove(sock)
                     
-                    # If no more clients for this detector, consider shutting it down
-                    if not socket_clients[detector_id] and detector_id in detectors:
-                        # Don't shut down immediately, detector may be reused
-                        pass
+                    # If no more clients for this detector, keep it running
+                    # Don't shut down immediately, detector may be reused
+                    if not socket_clients[detector_id]:
+                        socket_logger.info(f"No more clients for detector {detector_id}, but keeping it running for now")
 
 
 def check_periodic_save() -> None:
@@ -1058,20 +1231,127 @@ def check_periodic_save() -> None:
     global last_config_save_time
     current_time = time.time()
     
+    # First check disk space to avoid failures due to disk full
+    if check_disk_space() > 90:  # If disk space usage is more than 90%
+        logger.warning("Disk space is critically low, skipping configuration save")
+        # Update the time anyway to avoid repeated attempts
+        last_config_save_time = current_time
+        return
+    
     # Save configurations periodically
     if current_time - last_config_save_time > CONFIG_SAVE_INTERVAL:
         save_detectors_config()
         last_config_save_time = current_time
+        
+def check_disk_space() -> float:
+    """Check available disk space and perform cleanup if needed.
+    
+    Returns:
+        float: Disk usage percentage
+    """
+    try:
+        import os
+        import shutil
+        
+        # Get disk usage statistics
+        total, used, free = shutil.disk_usage(os.getcwd())
+        usage_percent = (used / total) * 100
+        
+        # Log disk usage
+        logger.info(f"Disk usage: {usage_percent:.1f}% (used: {used/1024/1024:.1f} MB, free: {free/1024/1024:.1f} MB)")
+        
+        # If disk usage is above 85%, perform cleanup
+        if usage_percent > 85:
+            logger.warning(f"Disk usage is high ({usage_percent:.1f}%), cleaning up old files")
+            
+            # Clean up debug frames directory
+            cleanup_old_files(os.path.join(os.getcwd(), "debug_frames"), days=1)
+            
+            # Clean up logs directory
+            log_dir = os.path.join(os.getcwd(), "logs")
+            if os.path.exists(log_dir):
+                cleanup_old_files(log_dir, days=3)
+                
+        return usage_percent
+    except Exception as ex:
+        logger.error(f"Error checking disk space: {ex}", exc_info=True)
+        return 0.0  # Return 0 on error
+        
+def cleanup_old_files(directory: str, days: int = 7) -> None:
+    """Delete files older than the specified number of days.
+    
+    Args:
+        directory: Directory to clean up
+        days: Delete files older than this many days
+    """
+    if not os.path.exists(directory):
+        return
+        
+    try:
+        import time
+        
+        current_time = time.time()
+        cutoff_time = current_time - (days * 24 * 60 * 60)
+        
+        count = 0
+        size = 0
+        
+        logger.info(f"Cleaning up files older than {days} days in {directory}")
+        
+        for root, dirs, files in os.walk(directory, topdown=False):
+            for file in files:
+                file_path = os.path.join(root, file)
+                try:
+                    file_mtime = os.path.getmtime(file_path)
+                    file_size = os.path.getsize(file_path)
+                    
+                    if file_mtime < cutoff_time:
+                        os.remove(file_path)
+                        count += 1
+                        size += file_size
+                except Exception as ex:
+                    logger.error(f"Error removing file {file_path}: {ex}")
+                    
+        # Also remove empty directories
+        for root, dirs, files in os.walk(directory, topdown=False):
+            for d in dirs:
+                dir_path = os.path.join(root, d)
+                try:
+                    if not os.listdir(dir_path):  # Check if directory is empty
+                        os.rmdir(dir_path)
+                except Exception as ex:
+                    logger.error(f"Error removing directory {dir_path}: {ex}")
+        
+        if count > 0:
+            logger.info(f"Cleaned up {count} files ({size/1024/1024:.1f} MB) in {directory}")
+    except Exception as ex:
+        logger.error(f"Error during cleanup: {ex}", exc_info=True)
 
 
 def start_socket_server() -> None:
     """Start the socket server."""
     global socket_server
     
+    # First check disk space on startup
+    initial_disk_usage = check_disk_space()
+    if initial_disk_usage > 90:
+        logger.critical(f"WARNING: Disk space critically low ({initial_disk_usage:.1f}%)! This may cause server instability.")
+        # Force an aggressive cleanup to free space
+        cleanup_old_files(os.path.join(os.getcwd(), "debug_frames"), days=0)  # Delete all debug frames
+        
+        # Check again after cleanup
+        post_cleanup_usage = check_disk_space()
+        if post_cleanup_usage > 90:
+            logger.critical(f"Disk space still critically low ({post_cleanup_usage:.1f}%) after cleanup attempt!")
+            logger.critical("You should manually free up disk space to prevent server failures.")
+    
     try:
         # Create a TCP socket
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Set socket timeout to avoid blocking forever
+        server.settimeout(60)  # 60 second timeout
         
         # Bind to all interfaces
         server.bind(("0.0.0.0", TCP_PORT))
@@ -1087,23 +1367,101 @@ def start_socket_server() -> None:
         save_thread.daemon = True
         save_thread.start()
         
+        # Start disk space monitoring thread
+        disk_monitor_thread = threading.Thread(target=disk_monitor_loop)
+        disk_monitor_thread.daemon = True
+        disk_monitor_thread.start()
+        
         # Accept connections
         while True:
-            client_sock, client_addr = server.accept()
-            client_thread = threading.Thread(
-                target=handle_client_connection,
-                args=(client_sock, client_addr)
-            )
-            client_thread.daemon = True
-            client_thread.start()
-            
-            # Check if we should save configurations
-            check_periodic_save()
+            try:
+                client_sock, client_addr = server.accept()
+                
+                # Check disk space on each new connection
+                disk_usage = check_disk_space()
+                if disk_usage > 95:  # extremely critical
+                    logger.critical(f"Disk space critically low ({disk_usage:.1f}%)! Refusing new connections.")
+                    try:
+                        client_sock.close()
+                    except:
+                        pass
+                    continue
+                
+                client_thread = threading.Thread(
+                    target=handle_client_connection,
+                    args=(client_sock, client_addr)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+                
+                # Check if we should save configurations
+                check_periodic_save()
+                
+            except socket.timeout:
+                # This is normal, just continue
+                continue
+            except Exception as accept_ex:
+                socket_logger.error(f"Error accepting connection: {str(accept_ex)}")
+                # Don't exit the loop on a single accept error
+                # Just wait a bit and try again
+                time.sleep(5)
             
     except Exception as ex:
-        socket_logger.error(f"Error in socket server: {str(ex)}", exc_info=True)
+        socket_logger.error(f"Fatal error in socket server: {str(ex)}", exc_info=True)
+        
+        # Try to shutdown gracefully
         if socket_server:
-            socket_server.close()
+            try:
+                socket_server.close()
+            except:
+                pass
+                
+        # Try to restart socket server after a delay
+        logger.info("Attempting to restart socket server in 30 seconds...")
+        time.sleep(30)
+        start_socket_server()  # Recursive restart
+
+
+def disk_monitor_loop() -> None:
+    """Background thread to monitor disk space."""
+    while True:
+        try:
+            # Check disk space every 5 minutes
+            disk_usage = check_disk_space()
+            
+            # If disk space is critically low, take action
+            if disk_usage > 95:  # extremely critical
+                logger.critical(f"Disk space CRITICALLY LOW: {disk_usage:.1f}%")
+                logger.critical("Performing emergency cleanup to free space")
+                
+                # Emergency cleanup - delete all debug frames
+                cleanup_old_files(os.path.join(os.getcwd(), "debug_frames"), days=0)
+                
+                # Also remove older logs
+                log_dir = os.path.join(os.getcwd(), "logs")
+                if os.path.exists(log_dir):
+                    cleanup_old_files(log_dir, days=1)  # Keep only 1 day of logs
+                    
+                # Check if the cleanup helped
+                new_usage = check_disk_space()
+                if new_usage > 90:
+                    logger.critical(f"Disk space still critically low after cleanup: {new_usage:.1f}%")
+                    logger.critical("Manual intervention required to free disk space!")
+                else:
+                    logger.info(f"Cleanup freed some space, disk usage now: {new_usage:.1f}%")
+                    
+            elif disk_usage > 85:  # high but not critical
+                logger.warning(f"Disk usage high: {disk_usage:.1f}%")
+                # Regular cleanup
+                cleanup_old_files(os.path.join(os.getcwd(), "debug_frames"), days=1)
+                
+            # Sleep for 5 minutes before checking again
+            time.sleep(300)
+            
+        except Exception as ex:
+            logger.error(f"Error in disk monitor loop: {ex}", exc_info=True)
+            # Sleep for 10 minutes on error
+            time.sleep(600)
 
 
 def periodic_save_loop() -> None:
