@@ -22,5 +22,14 @@ RUN mkdir -p /app/models
 # Expose the TCP socket port
 EXPOSE 5000
 
-# Command to run the server
-CMD ["python", "server.py"]
+# Create a startup script
+RUN echo '#!/bin/bash\n\
+# Start the watchdog in the background\n\
+python watchdog.py & \n\
+\n\
+# Start the server in the foreground\n\
+exec python server.py' > /app/start.sh && \
+    chmod +x /app/start.sh
+
+# Command to run both server and watchdog
+CMD ["/app/start.sh"]

@@ -370,6 +370,178 @@ class ProcessWatchdog:
                     break
                 time.sleep(1)
 
+class SocketWatchdog:
+    """
+    Monitor server socket health and restart the server if socket issues are detected.
+    
+    This watchdog specifically checks if the server is still properly listening on
+    its configured port and handling connections correctly.
+    """
+    
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5000,
+        check_interval: int = 30,  # seconds
+        max_failures: int = 3,
+        restart_delay: int = 5,  # seconds
+        restart_callback: Optional[Callable[[], None]] = None
+    ):
+        """
+        Initialize the socket watchdog.
+        
+        Args:
+            host: Host to check
+            port: Port to check
+            check_interval: How often to check socket (seconds)
+            max_failures: Max consecutive failures before taking action
+            restart_delay: Delay before restarting (seconds)
+            restart_callback: Function to call to restart the server
+        """
+        self.host = host
+        self.port = port
+        self.check_interval = check_interval
+        self.max_failures = max_failures
+        self.restart_delay = restart_delay
+        self.restart_callback = restart_callback
+        
+        self.failure_count = 0
+        self.running = False
+        self.thread = None
+        self.stop_event = threading.Event()
+        
+        # Use socket module for port checks
+        import socket
+        self.socket = socket
+    
+    def start(self):
+        """Start the socket watchdog thread."""
+        if self.running:
+            return
+        
+        self.running = True
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._monitor_loop)
+        self.thread.daemon = True
+        self.thread.start()
+        logger.info(f"Socket watchdog started for {self.host}:{self.port}")
+    
+    def stop(self):
+        """Stop the socket watchdog thread."""
+        if not self.running:
+            return
+        
+        self.running = False
+        self.stop_event.set()
+        
+        if self.thread:
+            self.thread.join(timeout=5)
+        
+        logger.info(f"Socket watchdog stopped for {self.host}:{self.port}")
+    
+    def _check_socket(self) -> bool:
+        """
+        Check if the socket is open and accepting connections.
+        
+        Returns:
+            bool: True if socket is healthy, False otherwise
+        """
+        sock = None
+        try:
+            # Create socket
+            sock = self.socket.socket(self.socket.AF_INET, self.socket.SOCK_STREAM)
+            sock.settimeout(5)  # 5 second timeout
+            
+            # Try to connect
+            result = sock.connect_ex((self.host, self.port))
+            if result != 0:
+                logger.warning(f"Socket check failed: connect_ex returned {result}")
+                return False
+            
+            # Additional check: Try to send/receive data
+            try:
+                # Send a valid message format that the server would expect
+                # This is a simplistic auth message just to test connection
+                test_message = {
+                    "type": "auth", 
+                    "detector_id": "socket_watchdog_test"
+                }
+                
+                import json
+                message_bytes = json.dumps(test_message).encode('utf-8')
+                length_bytes = len(message_bytes).to_bytes(4, byteorder="big")
+                
+                # Send message length followed by message
+                sock.sendall(length_bytes + message_bytes)
+                
+                # Try to receive response (just the length header is enough to verify connection)
+                response_length = sock.recv(4)
+                if not response_length or len(response_length) != 4:
+                    logger.warning("Socket check failed: couldn't receive response length")
+                    return False
+                
+                # Successfully sent and received data
+                return True
+                
+            except Exception as ex:
+                logger.warning(f"Socket data exchange failed: {str(ex)}")
+                return False
+                
+        except Exception as ex:
+            logger.warning(f"Socket check failed: {str(ex)}")
+            return False
+        finally:
+            # Make sure to close the socket
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+    
+    def _take_action(self):
+        """Take action when socket failures exceed threshold."""
+        logger.warning(f"Socket failure threshold exceeded ({self.max_failures} consecutive failures)")
+        
+        # Reset failure count
+        self.failure_count = 0
+        
+        if self.restart_callback:
+            logger.info(f"Restarting server after {self.restart_delay} seconds delay")
+            time.sleep(self.restart_delay)
+            try:
+                self.restart_callback()
+                logger.info("Server restart initiated")
+            except Exception as ex:
+                logger.error(f"Error restarting server: {str(ex)}")
+        else:
+            logger.warning("No restart callback provided, cannot restart server")
+    
+    def _monitor_loop(self):
+        """Main monitoring loop."""
+        while not self.stop_event.is_set():
+            try:
+                # Check socket health
+                if not self._check_socket():
+                    self.failure_count += 1
+                    logger.warning(f"Socket check failed ({self.failure_count}/{self.max_failures})")
+                    
+                    # Take action if failures exceed threshold
+                    if self.failure_count >= self.max_failures:
+                        self._take_action()
+                else:
+                    # Reset failure count on success
+                    if self.failure_count > 0:
+                        logger.info("Socket check passed, resetting failure count")
+                        self.failure_count = 0
+            except Exception as ex:
+                logger.error(f"Error in socket watchdog: {str(ex)}")
+            
+            # Wait for next check interval or until stop event
+            for _ in range(self.check_interval):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(1)
+
 class SystemWatchdog:
     """System-wide watchdog to monitor and recover from various failure conditions."""
     
@@ -377,6 +549,7 @@ class SystemWatchdog:
         """Initialize the system watchdog."""
         self.resource_monitor = None
         self.process_watchdogs = {}
+        self.socket_watchdog = None
         self.running = False
     
     def start(self):
@@ -405,6 +578,10 @@ class SystemWatchdog:
         # Stop all process watchdogs
         for watchdog in self.process_watchdogs.values():
             watchdog.stop()
+            
+        # Stop socket watchdog if running
+        if self.socket_watchdog:
+            self.socket_watchdog.stop()
         
         self.running = False
         logger.info("System watchdog stopped")
@@ -429,6 +606,30 @@ class SystemWatchdog:
             logger.info(f"Removed process watchdog for {name}")
         else:
             logger.warning(f"No process watchdog found for {name}")
+    
+    def add_socket_watchdog(self, host, port, restart_callback, **kwargs):
+        """Add a socket watchdog."""
+        if self.socket_watchdog:
+            logger.warning("Socket watchdog already exists, replacing")
+            self.socket_watchdog.stop()
+        
+        self.socket_watchdog = SocketWatchdog(
+            host=host,
+            port=port,
+            restart_callback=restart_callback,
+            **kwargs
+        )
+        self.socket_watchdog.start()
+        logger.info(f"Added socket watchdog for {host}:{port}")
+    
+    def remove_socket_watchdog(self):
+        """Remove the socket watchdog."""
+        if self.socket_watchdog:
+            self.socket_watchdog.stop()
+            self.socket_watchdog = None
+            logger.info("Removed socket watchdog")
+        else:
+            logger.warning("No socket watchdog found")
             
     def _handle_resource_threshold_exceeded(self, resource_type, value):
         """Handle a resource threshold being exceeded."""
@@ -464,9 +665,86 @@ class SystemWatchdog:
 # Global system watchdog instance
 system_watchdog = SystemWatchdog()
 
-def start_watchdog():
+def restart_server_process():
+    """Restart the server process."""
+    try:
+        logger.info("Attempting to restart server process")
+        
+        # First, check if we can find the server process
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # Look for python process running server.py
+                if proc.info['name'] == 'python' and any('server.py' in arg for arg in proc.info['cmdline'] if arg):
+                    logger.info(f"Found server process: PID {proc.pid}")
+                    
+                    # Try to restart gracefully first
+                    logger.info(f"Sending SIGHUP to PID {proc.pid}")
+                    os.kill(proc.pid, signal.SIGHUP)
+                    
+                    # Wait a bit for graceful restart
+                    time.sleep(5)
+                    
+                    # Check if process is still running
+                    if psutil.pid_exists(proc.pid):
+                        # If still running, terminate more forcefully
+                        logger.info(f"Process still running, sending SIGTERM to PID {proc.pid}")
+                        os.kill(proc.pid, signal.SIGTERM)
+                        
+                        # Wait for termination
+                        time.sleep(5)
+                        
+                        # If still running, kill forcefully
+                        if psutil.pid_exists(proc.pid):
+                            logger.warning(f"Process still running, sending SIGKILL to PID {proc.pid}")
+                            os.kill(proc.pid, signal.SIGKILL)
+                    
+                    # Process should be dead by now, wait a moment before starting new one
+                    time.sleep(5)
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
+        # Start a new server process
+        # Get the path to server.py
+        try:
+            import os.path
+            server_script = os.path.join(os.path.dirname(__file__), 'server.py')
+            
+            if os.path.exists(server_script):
+                logger.info(f"Starting new server process: {server_script}")
+                subprocess.Popen(['python', server_script], 
+                                 stdout=subprocess.PIPE, 
+                                 stderr=subprocess.PIPE)
+                logger.info("Server process started")
+            else:
+                logger.error(f"Server script not found: {server_script}")
+        except Exception as ex:
+            logger.error(f"Error starting server process: {str(ex)}")
+            
+    except Exception as ex:
+        logger.error(f"Error in restart_server_process: {str(ex)}")
+
+def start_watchdog(enable_socket_watchdog=True):
     """Start the system watchdog."""
     system_watchdog.start()
+    
+    # Add socket watchdog
+    if enable_socket_watchdog:
+        # Get server host/port 
+        host = os.environ.get("SERVER_HOST", "0.0.0.0")
+        port = int(os.environ.get("SERVER_PORT", "5000"))
+        
+        # For watchdog connections, we use localhost even if server binds to 0.0.0.0
+        watchdog_host = "localhost" if host == "0.0.0.0" else host
+        
+        logger.info(f"Adding socket watchdog for {watchdog_host}:{port}")
+        system_watchdog.add_socket_watchdog(
+            host=watchdog_host,
+            port=port,
+            restart_callback=restart_server_process,
+            check_interval=60,  # Check every 60 seconds
+            max_failures=3      # Restart after 3 consecutive failures
+        )
 
 def stop_watchdog():
     """Stop the system watchdog."""
@@ -474,9 +752,20 @@ def stop_watchdog():
 
 # Start watchdog if module is run directly
 if __name__ == "__main__":
-    start_watchdog()
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description="YOLO Presence Server Watchdog")
+    parser.add_argument("--disable-socket-watchdog", action="store_true", 
+                        help="Disable socket watchdog")
+    args = parser.parse_args()
+    
+    # Start watchdog
+    start_watchdog(not args.disable_socket_watchdog)
+    
     try:
+        logger.info("Watchdog running (press Ctrl+C to stop)")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+        logger.info("Stopping watchdog")
         stop_watchdog()
