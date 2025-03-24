@@ -3,16 +3,19 @@
 
 This standalone server handles video processing and object detection
 using YOLO models, designed to work with Home Assistant's yolo_presence
-integration through a simple API.
+integration through TCP socket connections.
 """
 import asyncio
 import json
 import logging
 import os
 import signal
+import socket
+import selectors
 import threading
 import time
-from typing import Dict, List, Optional, Any, Tuple
+import uuid
+from typing import Dict, List, Optional, Any, Tuple, Set
 
 import cv2
 import numpy as np
@@ -29,9 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("yolo_presence_server")
 
-# Flask app setup
+# Flask app setup (maintained for REST API management)
 app = Flask(__name__)
 CORS(app)
+
+# Socket server
+TCP_PORT = int(os.environ.get("TCP_PORT", 5001))
+socket_server = None
+socket_clients = {}  # Maps detector_id to set of socket connections
 
 # Global settings
 SUPPORTED_CLASSES = [0, 15, 16, 17]  # person, bird, cat, dog
@@ -464,7 +472,8 @@ class YoloDetector:
         }
         
     def _notify_sse_clients(self):
-        """Notify SSE clients of state changes."""
+        """Notify clients of state changes."""
+        # First, continue to support SSE clients (for backward compatibility)
         with sse_clients_lock:
             if self.detector_id in sse_clients:
                 # Create state message
@@ -484,6 +493,9 @@ class YoloDetector:
                 for dead_client in dead_clients:
                     if dead_client in sse_clients[self.detector_id]:
                         sse_clients[self.detector_id].remove(dead_client)
+        
+        # Now notify socket clients
+        notify_detector_state_change(self.detector_id, self.get_state())
 
 
 # API Routes
@@ -593,14 +605,21 @@ def get_detector_frame(detector_id):
 @app.route('/api/detectors/<detector_id>/events', methods=['GET'])
 def detector_events(detector_id):
     """SSE endpoint for real-time detector state updates."""
+    logger.info(f"SSE connection request received for detector {detector_id} from {request.remote_addr}")
+    logger.debug(f"Request headers: {request.headers}")
+    
     with detector_lock:
         if detector_id not in detectors:
+            logger.warning(f"SSE request for non-existent detector {detector_id}")
             return jsonify({"error": f"Detector {detector_id} not found"}), 404
         
         detector = detectors[detector_id]
     
     def event_stream():
         """Generate SSE event stream."""
+        client_id = f"{request.remote_addr}-{time.time()}"  # Unique ID for logging
+        logger.info(f"Starting SSE stream for client {client_id}, detector {detector_id}")
+        
         # Create queue for this client
         client_queue = queue.Queue(maxsize=10)
         
@@ -609,29 +628,49 @@ def detector_events(detector_id):
             if detector_id not in sse_clients:
                 sse_clients[detector_id] = []
             sse_clients[detector_id].append(client_queue)
+            logger.debug(f"Client {client_id} registered, total clients for detector {detector_id}: {len(sse_clients[detector_id])}")
         
         # Send initial state
         state = detector.get_state()
-        yield f"data: {json.dumps(state)}\n\n"
+        initial_message = f"data: {json.dumps(state)}\n\n"
+        logger.debug(f"Sending initial state to client {client_id}: {initial_message[:100]}...")
+        yield initial_message
+        
+        message_count = 0
+        keepalive_count = 0
         
         try:
             while True:
                 try:
                     # Wait for messages, timeout after 30 seconds to send keepalive
                     message = client_queue.get(timeout=30)
+                    message_count += 1
+                    logger.debug(f"Sending message #{message_count} to client {client_id}: {message[:100]}...")
                     yield message
                 except queue.Empty:
                     # Send keepalive message
-                    yield ": keepalive\n\n"
+                    keepalive_count += 1
+                    keepalive = ": keepalive\n\n"
+                    logger.debug(f"Sending keepalive #{keepalive_count} to client {client_id}")
+                    yield keepalive
+        except GeneratorExit:
+            logger.info(f"Client {client_id} disconnected after {message_count} messages and {keepalive_count} keepalives")
+            raise
+        except Exception as ex:
+            logger.error(f"Error in SSE stream for client {client_id}: {str(ex)}")
+            raise
         finally:
             # Remove client when connection is closed
             with sse_clients_lock:
                 if detector_id in sse_clients and client_queue in sse_clients[detector_id]:
                     sse_clients[detector_id].remove(client_queue)
+                    logger.info(f"Removed client {client_id}, remaining clients for detector {detector_id}: {len(sse_clients[detector_id])}")
                     # Clean up empty detector list
                     if not sse_clients[detector_id]:
                         del sse_clients[detector_id]
+                        logger.debug(f"No more clients for detector {detector_id}, removed from tracking")
     
+    logger.debug(f"Setting up SSE response for client {request.remote_addr}, detector {detector_id}")
     return Response(
         event_stream(),
         mimetype="text/event-stream",
@@ -642,6 +681,357 @@ def detector_events(detector_id):
         }
     )
 
+
+# Socket server implementation
+class SocketServer:
+    """TCP Socket server for real-time communication with clients."""
+    
+    def __init__(self, host="0.0.0.0", port=5001):
+        """Initialize socket server."""
+        self.host = host
+        self.port = port
+        self.selector = selectors.DefaultSelector()
+        self.sock = None
+        self.running = False
+        self.thread = None
+        self.clients = {}  # Maps connection to client info dict
+        self.socket_lock = threading.Lock()
+    
+    def start(self):
+        """Start the socket server."""
+        if self.running:
+            return
+            
+        logger.info(f"Starting socket server on {self.host}:{self.port}")
+        
+        # Create socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(100)
+        self.sock.setblocking(False)
+        
+        # Register with selector
+        self.selector.register(self.sock, selectors.EVENT_READ, self.accept_connection)
+        
+        # Start server thread
+        self.running = True
+        self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
+        self.thread.start()
+        
+        logger.info(f"Socket server started on {self.host}:{self.port}")
+        return True
+    
+    def run(self):
+        """Run the socket server loop."""
+        try:
+            while self.running:
+                events = self.selector.select(timeout=1)
+                for key, mask in events:
+                    callback = key.data
+                    callback(key.fileobj, mask)
+        except Exception as ex:
+            logger.error(f"Error in socket server loop: {str(ex)}")
+        finally:
+            self.stop()
+    
+    def accept_connection(self, sock, mask):
+        """Accept a new connection."""
+        conn, addr = sock.accept()
+        logger.info(f"New socket connection from {addr}")
+        conn.setblocking(False)
+        
+        # Initialize client info
+        client_id = str(uuid.uuid4())
+        detector_id = None  # Will be set during authentication
+        
+        client_info = {
+            "id": client_id,
+            "addr": addr,
+            "detector_id": detector_id,
+            "buffer": b"",
+            "authenticated": False,
+            "last_activity": time.time()
+        }
+        
+        # Register with selector for read events
+        self.selector.register(conn, selectors.EVENT_READ, 
+                              lambda s, m: self.read_data(s, m, client_info))
+        
+        with self.socket_lock:
+            self.clients[conn] = client_info
+    
+    def read_data(self, conn, mask, client_info):
+        """Read data from a connection."""
+        try:
+            data = conn.recv(4096)
+            if not data:
+                logger.info(f"Socket client {client_info['addr']} disconnected")
+                self.close_connection(conn)
+                return
+            
+            # Update last activity time
+            client_info["last_activity"] = time.time()
+            
+            # Add to buffer
+            client_info["buffer"] += data
+            
+            # Process complete messages
+            self.process_buffer(conn, client_info)
+            
+        except Exception as ex:
+            logger.error(f"Error reading from socket {client_info['addr']}: {str(ex)}")
+            self.close_connection(conn)
+    
+    def process_buffer(self, conn, client_info):
+        """Process the client's buffer for complete JSON messages."""
+        buffer = client_info["buffer"]
+        
+        # Messages are delimited by newline
+        while b"\n" in buffer:
+            # Split at the first newline
+            message_bytes, buffer = buffer.split(b"\n", 1)
+            client_info["buffer"] = buffer
+            
+            try:
+                # Decode and parse the message
+                message_str = message_bytes.decode("utf-8")
+                message = json.loads(message_str)
+                
+                # Process the message
+                self.handle_message(conn, client_info, message)
+                
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON from client {client_info['addr']}: {message_bytes}")
+            except Exception as ex:
+                logger.error(f"Error processing message from {client_info['addr']}: {str(ex)}")
+    
+    def handle_message(self, conn, client_info, message):
+        """Handle a received message."""
+        message_type = message.get("type")
+        
+        if not client_info["authenticated"]:
+            # Client must authenticate first
+            if message_type == "auth":
+                detector_id = message.get("detector_id")
+                if not detector_id:
+                    self.send_error(conn, "Missing detector_id in auth message")
+                    return
+                
+                # Register client with detector
+                client_info["detector_id"] = detector_id
+                client_info["authenticated"] = True
+                
+                with self.socket_lock:
+                    if detector_id not in socket_clients:
+                        socket_clients[detector_id] = set()
+                    socket_clients[detector_id].add(conn)
+                
+                # Send success response and initial state
+                with detector_lock:
+                    if detector_id in detectors:
+                        detector = detectors[detector_id]
+                        state = detector.get_state()
+                        self.send_message(conn, {
+                            "type": "auth_success",
+                            "state": state
+                        })
+                    else:
+                        # Detector doesn't exist yet - wait for creation
+                        self.send_message(conn, {
+                            "type": "auth_success",
+                            "state": None
+                        })
+                
+                logger.info(f"Client {client_info['addr']} authenticated for detector {detector_id}")
+            else:
+                self.send_error(conn, "Not authenticated")
+                
+        else:
+            # Handle messages for authenticated clients
+            detector_id = client_info["detector_id"]
+            
+            if message_type == "create_detector":
+                # Create a new detector
+                logger.info(f"Create detector request from {client_info['addr']}")
+                config = message.get("config", {})
+                
+                if not config or "stream_url" not in config:
+                    self.send_error(conn, "Missing required config for detector")
+                    return
+                
+                with detector_lock:
+                    # Check if detector already exists
+                    if detector_id in detectors:
+                        self.send_message(conn, {
+                            "type": "detector_exists",
+                            "state": detectors[detector_id].get_state()
+                        })
+                        return
+                    
+                    # Create new detector
+                    detector = YoloDetector(detector_id, config)
+                    
+                    # Start the detector
+                    if detector.initialize():
+                        detectors[detector_id] = detector
+                        self.send_message(conn, {
+                            "type": "detector_created",
+                            "state": detector.get_state()
+                        })
+                    else:
+                        self.send_error(conn, "Failed to initialize detector")
+            
+            elif message_type == "get_state":
+                # Get detector state
+                with detector_lock:
+                    if detector_id in detectors:
+                        detector = detectors[detector_id]
+                        self.send_message(conn, {
+                            "type": "state_update",
+                            "state": detector.get_state()
+                        })
+                    else:
+                        self.send_error(conn, f"Detector {detector_id} not found")
+            
+            elif message_type == "delete_detector":
+                # Delete a detector
+                with detector_lock:
+                    if detector_id in detectors:
+                        detector = detectors[detector_id]
+                        detector.shutdown()
+                        del detectors[detector_id]
+                        
+                        # Notify all clients for this detector
+                        self.notify_detector_clients(detector_id, {
+                            "type": "detector_deleted",
+                            "detector_id": detector_id
+                        })
+                        
+                        self.send_message(conn, {
+                            "type": "detector_deleted",
+                            "detector_id": detector_id
+                        })
+                    else:
+                        self.send_error(conn, f"Detector {detector_id} not found")
+            
+            elif message_type == "ping":
+                # Handle ping - just send a pong back
+                self.send_message(conn, {
+                    "type": "pong",
+                    "time": time.time()
+                })
+            
+            else:
+                self.send_error(conn, f"Unknown message type: {message_type}")
+    
+    def send_message(self, conn, message):
+        """Send a message to a client."""
+        try:
+            message_bytes = json.dumps(message).encode("utf-8") + b"\n"
+            conn.sendall(message_bytes)
+        except Exception as ex:
+            logger.error(f"Error sending message to client: {str(ex)}")
+            self.close_connection(conn)
+    
+    def send_error(self, conn, error_message):
+        """Send an error message to a client."""
+        self.send_message(conn, {
+            "type": "error",
+            "error": error_message
+        })
+    
+    def notify_detector_clients(self, detector_id, message):
+        """Send a message to all clients for a detector."""
+        with self.socket_lock:
+            if detector_id in socket_clients:
+                dead_clients = []
+                
+                for client_conn in socket_clients[detector_id]:
+                    try:
+                        self.send_message(client_conn, message)
+                    except Exception:
+                        dead_clients.append(client_conn)
+                
+                # Remove dead clients
+                for client in dead_clients:
+                    socket_clients[detector_id].remove(client)
+                
+                # Remove empty detector entry
+                if not socket_clients[detector_id]:
+                    del socket_clients[detector_id]
+    
+    def broadcast_detector_state(self, detector_id, state):
+        """Broadcast detector state update to all clients for this detector."""
+        self.notify_detector_clients(detector_id, {
+            "type": "state_update",
+            "state": state
+        })
+    
+    def close_connection(self, conn):
+        """Close a client connection and clean up."""
+        try:
+            # Get client info
+            with self.socket_lock:
+                if conn in self.clients:
+                    client_info = self.clients[conn]
+                    detector_id = client_info.get("detector_id")
+                    
+                    # Remove from clients
+                    del self.clients[conn]
+                    
+                    # Remove from detector clients
+                    if detector_id and detector_id in socket_clients and conn in socket_clients[detector_id]:
+                        socket_clients[detector_id].remove(conn)
+                        if not socket_clients[detector_id]:
+                            del socket_clients[detector_id]
+            
+            # Unregister from selector
+            self.selector.unregister(conn)
+            
+            # Close the connection
+            conn.close()
+            
+        except Exception as ex:
+            logger.error(f"Error closing connection: {str(ex)}")
+    
+    def stop(self):
+        """Stop the socket server."""
+        logger.info("Stopping socket server")
+        self.running = False
+        
+        # Close all client connections
+        with self.socket_lock:
+            for conn in list(self.clients.keys()):
+                try:
+                    self.close_connection(conn)
+                except Exception:
+                    pass
+            
+            self.clients.clear()
+        
+        # Close the server socket
+        if self.sock:
+            try:
+                self.selector.unregister(self.sock)
+                self.sock.close()
+            except Exception:
+                pass
+            
+        # Close the selector
+        try:
+            self.selector.close()
+        except Exception:
+            pass
+        
+        logger.info("Socket server stopped")
+
+# Modify YoloDetector to notify socket clients
+def notify_detector_state_change(detector_id, state):
+    """Notify socket clients about detector state change."""
+    if socket_server:
+        socket_server.broadcast_detector_state(detector_id, state)
 
 # Graceful shutdown handler
 def graceful_shutdown(signum, frame):
@@ -666,6 +1056,11 @@ def graceful_shutdown(signum, frame):
                 except queue.Full:
                     pass  # Ignore if queue is full
     
+    # Stop socket server
+    global socket_server
+    if socket_server:
+        socket_server.stop()
+    
     # Exit
     os._exit(0)
 
@@ -675,9 +1070,13 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
     
-    # Start the server
+    # Start the socket server
+    socket_server = SocketServer(host="0.0.0.0", port=TCP_PORT)
+    socket_server.start()
+    
+    # Start the Flask server for REST API
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("DEBUG", "False").lower() == "true"
     
-    logger.info(f"Starting YOLO Presence Detection Server on port {port}")
+    logger.info(f"Starting YOLO Presence Detection Server on HTTP port {port} and TCP port {TCP_PORT}")
     app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)

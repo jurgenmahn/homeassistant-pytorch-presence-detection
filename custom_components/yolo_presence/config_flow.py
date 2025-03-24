@@ -17,6 +17,8 @@ from .const import (
     CONF_INPUT_SIZE,
     CONF_MODEL,
     CONF_PROCESSING_SERVER,
+    CONF_PROCESSING_SERVER_PORT,
+    CONF_USE_TCP_CONNECTION,
     DEFAULT_NAME,
     DEFAULT_DETECTION_INTERVAL_CPU,
     DEFAULT_DETECTION_INTERVAL_GPU,
@@ -26,6 +28,8 @@ from .const import (
     DEFAULT_FRAME_SKIP_RATE_CPU,
     DEFAULT_FRAME_SKIP_RATE_GPU,
     DEFAULT_PROCESSING_SERVER,
+    DEFAULT_PROCESSING_SERVER_PORT,
+    DEFAULT_USE_TCP_CONNECTION,
     MODEL_OPTIONS,
     INPUT_SIZE_OPTIONS,
 )
@@ -112,6 +116,9 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema({
             vol.Required(CONF_NAME, default=DEFAULT_NAME): str,
             vol.Required(CONF_PROCESSING_SERVER, default=DEFAULT_PROCESSING_SERVER): str,
+            vol.Required(CONF_PROCESSING_SERVER_PORT, default=DEFAULT_PROCESSING_SERVER_PORT): 
+                vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+            vol.Required(CONF_USE_TCP_CONNECTION, default=DEFAULT_USE_TCP_CONNECTION): bool,
             vol.Required(CONF_STREAM_URL): str,
             vol.Required(CONF_MODEL, default=DEFAULT_MODEL): vol.In(MODEL_OPTIONS),
             vol.Required(CONF_DETECTION_INTERVAL, default=default_detection_interval): 
@@ -171,6 +178,14 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                 CONF_PROCESSING_SERVER, 
                 default=current_settings.get(CONF_PROCESSING_SERVER, DEFAULT_PROCESSING_SERVER)
             ): str,
+            vol.Required(
+                CONF_PROCESSING_SERVER_PORT, 
+                default=current_settings.get(CONF_PROCESSING_SERVER_PORT, DEFAULT_PROCESSING_SERVER_PORT)
+            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+            vol.Required(
+                CONF_USE_TCP_CONNECTION, 
+                default=current_settings.get(CONF_USE_TCP_CONNECTION, DEFAULT_USE_TCP_CONNECTION)
+            ): bool,
             vol.Required(
                 CONF_STREAM_URL, 
                 default=current_settings.get(CONF_STREAM_URL)

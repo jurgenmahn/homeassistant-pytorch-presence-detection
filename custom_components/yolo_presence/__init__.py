@@ -15,6 +15,10 @@ from .const import (
     DATA_YOLO_PRESENCE,
     ATTR_DEVICE_ID,
     CONF_PROCESSING_SERVER,
+    CONF_PROCESSING_SERVER_PORT,
+    CONF_USE_TCP_CONNECTION,
+    DEFAULT_PROCESSING_SERVER_PORT,
+    DEFAULT_USE_TCP_CONNECTION,
 )
 from .api_client import YoloProcessingApiClient
 
@@ -32,11 +36,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Create API client instance
     server_url = config.get(CONF_PROCESSING_SERVER)
+    server_port = config.get(CONF_PROCESSING_SERVER_PORT, DEFAULT_PROCESSING_SERVER_PORT)
+    use_tcp = config.get(CONF_USE_TCP_CONNECTION, DEFAULT_USE_TCP_CONNECTION)
+    
     client = YoloProcessingApiClient(
         hass=hass,
         server_url=server_url,
         detector_id=entry.entry_id,
         update_interval=1,
+        server_port=server_port,
+        use_tcp=use_tcp,
     )
 
     # Store client instance

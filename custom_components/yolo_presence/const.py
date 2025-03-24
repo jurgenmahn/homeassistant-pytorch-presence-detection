@@ -11,6 +11,8 @@ CONF_CONFIDENCE_THRESHOLD = "confidence_threshold"
 CONF_INPUT_SIZE = "input_size"
 CONF_MODEL = "model"
 CONF_PROCESSING_SERVER = "processing_server"
+CONF_PROCESSING_SERVER_PORT = "processing_server_port"
+CONF_USE_TCP_CONNECTION = "use_tcp_connection"
 
 # Entity attributes
 ATTR_DEVICE_ID = "device_id"
@@ -32,6 +34,8 @@ DEFAULT_MODEL = "yolo11l"
 DEFAULT_FRAME_SKIP_RATE_CPU = 5
 DEFAULT_FRAME_SKIP_RATE_GPU = 3
 DEFAULT_PROCESSING_SERVER = "http://localhost:5000"
+DEFAULT_PROCESSING_SERVER_PORT = 5001
+DEFAULT_USE_TCP_CONNECTION = True  # Default to TCP connection for better performance
 
 # SCAN_INTERVAL for sensors updates (seconds)
 SCAN_INTERVAL = 1
