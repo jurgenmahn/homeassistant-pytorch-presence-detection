@@ -68,5 +68,3 @@ The server supports the following YOLO models:
 - yolo11m: Balanced speed/accuracy
 - yolo11l: Slower, high accuracy
 - yolo11x: Slowest, highest accuracy
-
-Models should be placed in the `models` directory with the `.pt` extension (e.g., `yolo11l.pt`).

@@ -2,14 +2,15 @@
 
 ## Environment and Setup
 - Python version: 3.12.3
-- Runtime: `python demo.py` - Runs YOLO object detection on RTSP stream
+- Default runtime: `docker-compose up -d` in processing_unit/ directory
+- For development: `python processing_unit/server.py` for the processing server
 
 ## Testing and Linting
 - Install linting tools: `pip install black ruff isort mypy`
 - Format code: `black .`
 - Lint code: `ruff check .`
 - Type checking: `mypy --ignore-missing-imports .`
-- Run tests: `pytest tests/` or `pytest tests/test_file.py::test_function`
+- Run single test: `python development/test-gpu-acceleration.py` (or other test files in development/)
 
 ## Code Style & Conventions
 - **Imports**: Group in order: standard library, third-party packages, local modules
@@ -21,6 +22,7 @@
 - **Documentation**: Docstrings for classes and functions (Google style)
 
 ## Project Structure
-- Main application: demo.py
-- YOLO models in models/ directory
-- Use ultralytics YOLO package for model inference
+- Processing Server: processing_unit/server.py
+- HA Integration: custom_components/yolo_presence/
+- YOLO models in models/ directory (yolo11n, yolo11s, yolo11m, yolo11l, yolo11x)
+- Uses ultralytics YOLO package for model inference

@@ -44,27 +44,30 @@ async def validate_stream_url(hass: HomeAssistant, stream_url: str) -> tuple[boo
     return True, "Stream will be validated by the processing server"
 
 
-async def validate_processing_server(hass: HomeAssistant, server_url: str) -> tuple[bool, str]:
-    """Test if the processing server is accessible."""
-    from aiohttp import ClientSession, ClientError
+async def validate_processing_server(hass: HomeAssistant, server_host: str) -> tuple[bool, str]:
+    """Test if the processing server is accessible via TCP socket."""
     import asyncio
+    import socket
     
     try:
-        async with ClientSession() as session:
-            try:
-                async with session.get(f"{server_url.rstrip('/')}/api/status", timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("status") == "running":
-                            return True, "Success"
-                        else:
-                            return False, "Server responded but is not in running state"
-                    else:
-                        return False, f"Server responded with status code {response.status}"
-            except asyncio.TimeoutError:
-                return False, "Connection timed out"
-            except ClientError as ex:
-                return False, f"Connection error: {str(ex)}"
+        # Get port from config or use default
+        port = hass.data.get("port", 5000)
+        
+        # Try to establish a connection to check if the server is reachable
+        future = asyncio.open_connection(
+            server_host, 
+            port
+        )
+        
+        try:
+            reader, writer = await asyncio.wait_for(future, timeout=5)
+            writer.close()
+            await writer.wait_closed()
+            return True, "Success"
+        except asyncio.TimeoutError:
+            return False, "Connection timed out"
+        except (ConnectionRefusedError, socket.gaierror) as ex:
+            return False, f"Connection error: {str(ex)}"
     except Exception as ex:
         return False, f"Error connecting to server: {str(ex)}"
 
@@ -150,7 +153,10 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
 
     def __init__(self, config_entry):
         """Initialize options flow."""
-        self.config_entry = config_entry
+        # Don't save the config_entry reference directly
+        self._entry_id = config_entry.entry_id
+        self._entry_data = {**config_entry.data}
+        self._entry_options = {**config_entry.options}
 
     async def async_step_init(self, user_input=None):
         """Manage the options."""
@@ -159,7 +165,7 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             # Validate processing server URL if changed
             if (CONF_PROCESSING_SERVER in user_input and
-                user_input[CONF_PROCESSING_SERVER] != self.config_entry.data.get(CONF_PROCESSING_SERVER)):
+                user_input[CONF_PROCESSING_SERVER] != self._entry_data.get(CONF_PROCESSING_SERVER)):
                 valid_server, server_message = await validate_processing_server(
                     self.hass, user_input[CONF_PROCESSING_SERVER]
                 )
@@ -171,7 +177,7 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=user_input)
 
         # Prepare current settings
-        current_settings = {**self.config_entry.data, **self.config_entry.options}
+        current_settings = {**self._entry_data, **self._entry_options}
         
         data_schema = vol.Schema({
             vol.Required(

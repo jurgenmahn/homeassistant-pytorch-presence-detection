@@ -134,5 +134,3 @@ The integration fires the following events:
 This project is licensed under the MIT License.
 
 ---
-
-Created by Jurgen Mahn with assistance from Claude Code, based on Ultralytics YOLO.

@@ -19,7 +19,7 @@ COPY . .
 # Create models directory
 RUN mkdir -p /app/models
 
-# Expose the API port
+# Expose the TCP socket port
 EXPOSE 5000
 
 # Command to run the server
