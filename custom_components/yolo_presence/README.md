@@ -129,6 +129,23 @@ The integration fires the following events:
 - For CPU resource issues, try using a smaller model (nano or small) and increasing the detection interval
 - See the logs for more detailed error messages
 
+## Automatic Detector Recovery
+
+The integration includes a detector health monitoring system that:
+
+- Checks every minute if each configured detector is running on the server
+- Monitors detector responses to verify they're properly functioning
+- Automatically recreates detectors if they're missing or not responding
+- Ensures continuous operation even if the processing server restarts
+
+This feature helps maintain system reliability by automatically recovering from:
+- Server restarts or crashes
+- Network interruptions
+- Configuration loss on the server side
+- Detector process termination
+
+The health check runs in the background and requires no manual intervention.
+
 ## License
 
 This project is licensed under the MIT License.
