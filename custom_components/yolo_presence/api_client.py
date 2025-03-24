@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import socket
 import time
 from typing import Dict, Any, Optional, Callable
 from homeassistant.core import HomeAssistant
@@ -115,10 +116,54 @@ class YoloProcessingApiClient:
 
                 # Create TCP connection with timeout
                 try:
-                    connection_future = asyncio.open_connection(self.host, self.port)
+                    # Log that we're attempting to connect
+                    _LOGGER.info(
+                        "Attempting to establish TCP connection to %s:%s with timeout=%ss",
+                        self.host,
+                        self.port,
+                        self._connection_timeout,
+                    )
+
+                    connection_future = asyncio.open_connection(
+                        self.host,
+                        self.port,
+                        # Set explicit socket options for keepalive
+                        family=socket.AF_INET,
+                    )
                     self._reader, self._writer = await asyncio.wait_for(
                         connection_future, timeout=self._connection_timeout
                     )
+
+                    # Configure socket options for the connection if possible
+                    try:
+                        sock = self._writer.get_extra_info("socket")
+                        if sock:
+                            # Enable TCP keepalive
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                            # Set TCP keepalive parameters if supported by platform
+                            if (
+                                hasattr(socket, "TCP_KEEPIDLE")
+                                and hasattr(socket, "TCP_KEEPINTVL")
+                                and hasattr(socket, "TCP_KEEPCNT")
+                            ):
+                                # Time before sending keepalive probes (seconds)
+                                sock.setsockopt(
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60
+                                )
+                                # Time between keepalive probes (seconds)
+                                sock.setsockopt(
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10
+                                )
+                                # Number of keepalive probes before giving up
+                                sock.setsockopt(
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3
+                                )
+
+                            _LOGGER.debug("Socket keepalive options configured")
+                    except Exception as sock_err:
+                        _LOGGER.warning("Could not set socket options: %s", sock_err)
+
                 except (asyncio.TimeoutError, ConnectionRefusedError) as err:
                     _LOGGER.error(
                         "Failed to connect to YOLO Processing Server: %s", err
@@ -350,13 +395,19 @@ class YoloProcessingApiClient:
         """Start the heartbeat task."""
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            _LOGGER.debug("Heartbeat monitoring started")
+            _LOGGER.debug(
+                "Heartbeat monitoring started with interval=%ss",
+                self._heartbeat_interval,
+            )
 
     def _start_health_check(self) -> None:
         """Start the health check task."""
         if self._health_check_task is None or self._health_check_task.done():
             self._health_check_task = asyncio.create_task(self._health_check_loop())
-            _LOGGER.debug("Health check monitoring started")
+            _LOGGER.debug(
+                "Health check monitoring started with interval=%ss",
+                self._health_check_interval,
+            )
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to keep the connection alive and monitor responses."""
@@ -364,6 +415,24 @@ class YoloProcessingApiClient:
             while not self._stop_event.is_set():
                 if self._connected:
                     current_time = time.time()
+
+                    # Validate connection objects are still valid
+                    if self._writer is None or self._reader is None:
+                        _LOGGER.warning(
+                            "Heartbeat detected invalid connection (reader/writer is None)"
+                        )
+                        await self._close_connection()
+                        self._reconnect_event.set()
+                        await asyncio.sleep(1)
+                        continue
+
+                    # Check if writer is closing or closed
+                    if self._writer.is_closing():
+                        _LOGGER.warning("Heartbeat detected closing writer")
+                        await self._close_connection()
+                        self._reconnect_event.set()
+                        await asyncio.sleep(1)
+                        continue
 
                     # Check if it's time to send a heartbeat
                     if (
@@ -409,7 +478,8 @@ class YoloProcessingApiClient:
                             await asyncio.sleep(1)  # Small delay before continuing
                             continue
 
-                await asyncio.sleep(2)  # Check more frequently
+                # Check more frequently - reduced from 2s to 1s for faster detection
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             _LOGGER.debug("Heartbeat task cancelled")
         except Exception as err:
@@ -650,19 +720,64 @@ class YoloProcessingApiClient:
             raise ConnectionError("Not connected to server")
 
         try:
+            # Additional validation before reading
+            if self._writer and self._writer.is_closing():
+                _LOGGER.warning("Writer is closing, cannot read message")
+                raise ConnectionError("Writer is closing")
+
             # Read message length (4 bytes)
             try:
-                length_bytes = await self._reader.readexactly(4)
+                # Use a timeout to prevent hanging on read operations
+                try:
+                    length_bytes = await asyncio.wait_for(
+                        self._reader.readexactly(4), timeout=self._connection_timeout
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout reading message length")
+                    raise ConnectionError("Timeout reading message length")
+
                 length = int.from_bytes(length_bytes, byteorder="big")
 
-                # Sanity check for length to prevent memory issues
-                if length <= 0 or length > 1024 * 1024:  # 1 MB max
-                    _LOGGER.error("Invalid message length: %s bytes", length)
-                    raise ConnectionError("Invalid message length")
+                # Improved sanity check for length to prevent memory issues
+                if length <= 0:
+                    _LOGGER.error(
+                        "Invalid message length: %s bytes (zero or negative)", length
+                    )
+                    raise ConnectionError("Invalid message length (zero or negative)")
 
-                # Read message data
-                data = await self._reader.readexactly(length)
-                message = json.loads(data.decode("utf-8"))
+                if length > 1024 * 1024:  # 1 MB max
+                    _LOGGER.error(
+                        "Invalid message length: %s bytes (exceeds maximum)", length
+                    )
+                    raise ConnectionError("Invalid message length (exceeds maximum)")
+
+                # Read message data with timeout
+                try:
+                    data = await asyncio.wait_for(
+                        self._reader.readexactly(length),
+                        timeout=self._connection_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout reading message data (%s bytes)", length)
+                    raise ConnectionError(
+                        f"Timeout reading message data ({length} bytes)"
+                    )
+
+                try:
+                    message = json.loads(data.decode("utf-8"))
+                except UnicodeDecodeError as decode_err:
+                    _LOGGER.error("Unicode decode error: %s", decode_err)
+                    # Log the first 100 bytes of data to help debug
+                    _LOGGER.error("First 100 bytes: %s", data[:100])
+                    raise ConnectionError(f"Unicode decode error: {decode_err}")
+                except json.JSONDecodeError as json_err:
+                    _LOGGER.error("JSON decode error: %s", json_err)
+                    # Log the first 100 chars of data to help debug
+                    _LOGGER.error(
+                        "First 100 chars: %s",
+                        data.decode("utf-8", errors="replace")[:100],
+                    )
+                    raise ConnectionError(f"JSON decode error: {json_err}")
 
                 # Log received message but don't handle it here
                 # Heartbeat handling is now done in _handle_message
@@ -670,9 +785,11 @@ class YoloProcessingApiClient:
                 _LOGGER.debug("Received message type: %s", message_type)
 
                 return message
-            except asyncio.IncompleteReadError:
-                _LOGGER.warning("Connection closed by server")
-                raise ConnectionError("Connection closed by server")
+            except asyncio.IncompleteReadError as incomplete_err:
+                _LOGGER.warning(
+                    "Connection closed by server (incomplete read: %s)", incomplete_err
+                )
+                raise ConnectionError(f"Connection closed by server: {incomplete_err}")
             except (ConnectionResetError, BrokenPipeError) as err:
                 _LOGGER.warning("Connection error while reading: %s", err)
                 raise ConnectionError(f"Connection error: {err}")
@@ -680,7 +797,7 @@ class YoloProcessingApiClient:
                 raise  # Re-raise cancellation
         except json.JSONDecodeError as err:
             _LOGGER.error("Failed to decode message: %s", err)
-            raise
+            raise ConnectionError(f"JSON decode error: {err}")
         except OSError as err:
             _LOGGER.error("Socket error while reading message: %s", err)
             raise ConnectionError(f"Socket error: {err}")
@@ -690,7 +807,7 @@ class YoloProcessingApiClient:
 
     async def _send_message(self, message: Dict[str, Any]) -> bool:
         """
-        Send a message to the server.
+        Send a message to the server with enhanced reliability and error handling.
 
         Returns:
             bool: True if the message was sent successfully, False on connection errors
@@ -707,6 +824,22 @@ class YoloProcessingApiClient:
                 self._reconnect_event.set()
                 return False
 
+            # Check socket is valid by trying to get peername
+            try:
+                peername = self._writer.get_extra_info("peername")
+                if peername is None:
+                    _LOGGER.warning("Cannot send message - socket has no peername")
+                    await self._close_connection()
+                    self._reconnect_event.set()
+                    return False
+            except Exception as peer_err:
+                _LOGGER.warning(
+                    "Cannot validate socket - get_extra_info failed: %s", peer_err
+                )
+                await self._close_connection()
+                self._reconnect_event.set()
+                return False
+
             # Encode message to JSON
             try:
                 data = json.dumps(message).encode("utf-8")
@@ -719,9 +852,25 @@ class YoloProcessingApiClient:
                 length = len(data)
                 self._writer.write(length.to_bytes(4, byteorder="big"))
                 self._writer.write(data)
-                await self._writer.drain()
 
-                _LOGGER.debug("Sent message: %s", message)
+                # Use timeout for drain to prevent hanging
+                try:
+                    await asyncio.wait_for(
+                        self._writer.drain(), timeout=self._connection_timeout
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        "Timeout during writer.drain(), connection may be stalled"
+                    )
+                    await self._close_connection()
+                    self._reconnect_event.set()
+                    return False
+
+                _LOGGER.debug(
+                    "Sent message type=%s to %s",
+                    message.get("type", "unknown"),
+                    peername,
+                )
                 return True
             except ConnectionResetError as conn_err:
                 _LOGGER.warning("Connection reset while sending message: %s", conn_err)
