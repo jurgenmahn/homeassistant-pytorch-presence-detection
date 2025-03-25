@@ -66,7 +66,12 @@ AUTH_ENABLED = os.environ.get("ENABLE_AUTH", "false").lower() in ("true", "1", "
 AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "yolopassword")
 # Create auth protection pattern
-PROTECTED_PATHS = ["/", "/view", "/stream"]  # Paths that require authentication
+PROTECTED_PATHS = [
+    "/",
+    "/view",
+    "/stream",
+    "/jpeg",
+]  # Paths that require authentication
 
 # Store for detector instances (key: detector_id)
 detectors: Dict[str, Any] = {}  # Will store YoloDetector instances
@@ -1743,10 +1748,15 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             )
                             return
 
-                        # Set MJPEG stream headers
-                        boundary = "mjpegboundary"
+                        # SAFETY BYPASS: Instead of streaming directly in the main server thread,
+                        # Use a static image with a JavaScript-based stream approach
+                        logger.info(
+                            f"Using static image approach for detector {detector_id}"
+                        )
+
+                        # Set headers for HTML page
                         self.send_response(200)
-                        # Ensure proper Content-Type for MJPEG stream
+                        self.send_header("Content-Type", "text/html")
                         self.send_header(
                             "Content-Type",
                             f"multipart/x-mixed-replace; boundary={boundary}",
@@ -1923,6 +1933,71 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                 except Exception as ex:
                     logger.error(f"Error streaming frames: {ex}", exc_info=True)
                     self._send_error_response(f"Error streaming frames: {str(ex)}", 500)
+            elif path == "/jpeg" and detector_id:
+                # Return a single JPEG frame - much safer than continuous MJPEG streaming
+                try:
+                    with detector_lock:
+                        if detector_id not in detectors:
+                            self._send_error_response(
+                                f"Detector {detector_id} not found", 404
+                            )
+                            return
+
+                        detector = detectors[detector_id]
+
+                        # Get the frame
+                        if detector.last_annotated_frame is not None:
+                            frame = detector.last_annotated_frame.copy()
+                        else:
+                            # Create placeholder
+                            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                            cv2.putText(
+                                frame,
+                                "Waiting for detection...",
+                                (50, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1,
+                                (255, 255, 255),
+                                2,
+                            )
+
+                    # Add timestamp outside the lock
+                    current_time = time.strftime("%H:%M:%S")
+                    cv2.putText(
+                        frame,
+                        f"Time: {current_time}",
+                        (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+
+                    # Encode as JPEG
+                    _, jpg_data = cv2.imencode(
+                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                    )
+                    jpg_bytes = jpg_data.tobytes()
+
+                    # Send the JPEG
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(jpg_bytes)))
+                    self.send_header(
+                        "Cache-Control", "no-cache, no-store, must-revalidate"
+                    )
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.end_headers()
+                    self.wfile.write(jpg_bytes)
+                    return
+
+                except Exception as ex:
+                    logger.error(f"Error sending JPEG frame: {ex}", exc_info=True)
+                    self._send_error_response(
+                        f"Error sending JPEG frame: {str(ex)}", 500
+                    )
+
             elif path == "/view" and detector_id:
                 # Return an HTML page with the stream embedded
                 try:
@@ -1996,27 +2071,160 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     <p>Auto-optimization: {"Enabled" if detector.auto_optimization else "Disabled"}</p>
                                 </div>
                                 
-                                <img src="/stream?detector_id={detector_id}" class="stream" alt="Live detection stream" style="width:100%; height:auto; min-height:320px;" />
+                                <div class="stream-container">
+                                    <img id="stream-img" class="stream-img" src="/jpeg?detector_id={detector_id}" alt="Live detection stream" style="width:100%; height:auto; min-height:320px;" />
+                                    <div id="connection-status" style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.7); color:white; padding:5px;">Connected</div>
+                                    <div id="fps-counter" style="position:absolute; top:10px; right:10px; background:rgba(0,0,0,0.7); color:white; padding:5px;">0 FPS</div>
+                                    <div style="position:absolute; bottom:0; left:0; right:0; background:rgba(0,0,0,0.7); color:white; padding:5px; text-align:left;">
+                                        <span id="status-text">Ready</span>
+                                    </div>
+                                </div>
                                 <script>
-                                    // Check if image loads correctly and refresh if needed
+                                    // JavaScript to fetch and update the image (JPEG polling instead of MJPEG streaming)
                                     document.addEventListener('DOMContentLoaded', function() {{
-                                        const streamImg = document.querySelector('.stream');
-                                        streamImg.onerror = function() {{
-                                            console.log('Stream image error, reloading...');
-                                            setTimeout(() => {{
-                                                // Append timestamp to force refresh of image source
-                                                streamImg.src = '/stream?detector_id={detector_id}&t=' + Date.now();
-                                            }}, 2000);
-                                        }};
+                                        const streamImg = document.getElementById('stream-img');
+                                        const statusText = document.getElementById('status-text');
+                                        const connectionStatus = document.getElementById('connection-status');
+                                        const fpsCounter = document.getElementById('fps-counter');
                                         
-                                        // Also periodically check if image needs refresh
+                                        // Add buttons for control
+                                        const buttonContainer = document.createElement('p');
+                                        
+                                        const pauseButton = document.createElement('button');
+                                        pauseButton.textContent = 'Pause Stream';
+                                        pauseButton.style.padding = '10px 15px';
+                                        pauseButton.style.margin = '0 5px';
+                                        pauseButton.style.backgroundColor = '#007bff';
+                                        pauseButton.style.color = 'white';
+                                        pauseButton.style.border = 'none';
+                                        pauseButton.style.borderRadius = '3px';
+                                        pauseButton.style.cursor = 'pointer';
+                                        
+                                        const fasterButton = document.createElement('button');
+                                        fasterButton.textContent = 'Faster';
+                                        fasterButton.style.padding = '10px 15px';
+                                        fasterButton.style.margin = '0 5px';
+                                        fasterButton.style.backgroundColor = '#28a745';
+                                        fasterButton.style.color = 'white';
+                                        fasterButton.style.border = 'none';
+                                        fasterButton.style.borderRadius = '3px';
+                                        fasterButton.style.cursor = 'pointer';
+                                        
+                                        const slowerButton = document.createElement('button');
+                                        slowerButton.textContent = 'Slower';
+                                        slowerButton.style.padding = '10px 15px';
+                                        slowerButton.style.margin = '0 5px';
+                                        slowerButton.style.backgroundColor = '#dc3545';
+                                        slowerButton.style.color = 'white';
+                                        slowerButton.style.border = 'none';
+                                        slowerButton.style.borderRadius = '3px';
+                                        slowerButton.style.cursor = 'pointer';
+                                        
+                                        // Add the buttons to the container
+                                        buttonContainer.appendChild(pauseButton);
+                                        buttonContainer.appendChild(fasterButton);
+                                        buttonContainer.appendChild(slowerButton);
+                                        
+                                        // Add the container before the existing button
+                                        document.querySelector('.refresh').parentNode.insertBefore(
+                                            buttonContainer, 
+                                            document.querySelector('.refresh')
+                                        );
+                                        
+                                        let isPaused = false;
+                                        let frameCount = 0;
+                                        let lastTimestamp = Date.now();
+                                        let errors = 0;
+                                        const maxErrors = 5;
+                                        let updateInterval = 100; // 100ms = 10 FPS initially
+                                        
+                                        // Update FPS counter
                                         setInterval(() => {{
-                                            // If the image height is very small, it might indicate a problem
-                                            if (streamImg.naturalHeight < 10) {{
-                                                console.log('Stream image too small, refreshing...');
-                                                streamImg.src = '/stream?detector_id={detector_id}&t=' + Date.now();
+                                            const now = Date.now();
+                                            const elapsed = (now - lastTimestamp) / 1000;
+                                            if (elapsed > 0) {{
+                                                const fps = frameCount / elapsed;
+                                                fpsCounter.textContent = `${{fps.toFixed(1)}} FPS`;
+                                                frameCount = 0;
+                                                lastTimestamp = now;
                                             }}
-                                        }}, 5000);
+                                        }}, 1000);
+                                        
+                                        // Toggle pause/resume
+                                        pauseButton.addEventListener('click', function() {{
+                                            isPaused = !isPaused;
+                                            pauseButton.textContent = isPaused ? 'Resume Stream' : 'Pause Stream';
+                                            if (!isPaused) updateFrame(); // Resume immediately
+                                            statusText.textContent = isPaused ? 'Paused' : 'Streaming';
+                                        }});
+                                        
+                                        // Faster button
+                                        fasterButton.addEventListener('click', function() {{
+                                            if (updateInterval > 16) {{
+                                                updateInterval = Math.max(16, updateInterval - 30);
+                                                statusText.textContent = `FPS Target: ${{Math.round(1000/updateInterval)}}`;
+                                            }}
+                                        }});
+                                        
+                                        // Slower button
+                                        slowerButton.addEventListener('click', function() {{
+                                            if (updateInterval < 1000) {{
+                                                updateInterval += 50;
+                                                statusText.textContent = `FPS Target: ${{Math.round(1000/updateInterval)}}`;
+                                            }}
+                                        }});
+                                        
+                                        // Function to fetch a new frame
+                                        function updateFrame() {{
+                                            if (isPaused) return;
+                                            
+                                            fetch(`/jpeg?detector_id={detector_id}&t=${{Date.now()}}`)
+                                                .then(response => {{
+                                                    if (!response.ok) throw new Error(`HTTP error ${{response.status}}`);
+                                                    return response.blob();
+                                                }})
+                                                .then(blob => {{
+                                                    // Create image URL
+                                                    const url = URL.createObjectURL(blob);
+                                                    
+                                                    // When image is loaded, release the old object URL to prevent memory leaks
+                                                    const oldSrc = streamImg.src;
+                                                    streamImg.onload = function() {{
+                                                        if (oldSrc.startsWith('blob:')) {{
+                                                            URL.revokeObjectURL(oldSrc);
+                                                        }}
+                                                        this.onload = null;
+                                                    }};
+                                                    
+                                                    // Update image with new frame
+                                                    streamImg.src = url;
+                                                    frameCount++;
+                                                    errors = 0; // Reset error counter on success
+                                                    connectionStatus.textContent = 'Connected';
+                                                    connectionStatus.style.backgroundColor = 'rgba(0, 128, 0, 0.7)';
+                                                    
+                                                    if (!statusText.textContent.includes('FPS Target')) {{
+                                                        statusText.textContent = 'Streaming';
+                                                    }}
+                                                    
+                                                    // Schedule next update
+                                                    setTimeout(updateFrame, updateInterval);
+                                                }})
+                                                .catch(error => {{
+                                                    console.error('Error fetching frame:', error);
+                                                    errors++;
+                                                    statusText.textContent = `Error: ${{error.message}}`;
+                                                    connectionStatus.textContent = 'Reconnecting...';
+                                                    connectionStatus.style.backgroundColor = 'rgba(255, 0, 0, 0.7)';
+                                                    
+                                                    // If too many errors, slow down requests
+                                                    const delay = errors > maxErrors ? 2000 : 500;
+                                                    setTimeout(updateFrame, delay);
+                                                }});
+                                        }}
+                                        
+                                        // Start updating frames
+                                        updateFrame();
                                     }});
                                 
                                 <p>
