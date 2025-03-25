@@ -22,14 +22,9 @@ RUN mkdir -p /app/models
 # Expose the TCP socket port
 EXPOSE 5505
 
-# Create a startup script
-RUN echo '#!/bin/bash\n\
-# Start the watchdog in the background\n\
-python watchdog.py & \n\
-\n\
-# Start the server in the foreground\n\
-exec python server.py' > /app/start.sh && \
-    chmod +x /app/start.sh
+# Copy and use the startup script
+COPY new_scripts/start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
-# Command to run both server and watchdog
+# Command to run the server
 CMD ["/app/start.sh"]
