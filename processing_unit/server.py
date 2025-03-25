@@ -129,7 +129,7 @@ class YoloDetector:
         self.max_idle_time = 3600  # 1 hour - shut down detector if no requests
 
     def initialize(self) -> bool:
-        """Initialize the detector and start the detection process."""
+        """Initialize the detector."""
         try:
             logger.info(
                 f"Initializing detector {self.detector_id} with model {self.model_name}"
@@ -138,17 +138,16 @@ class YoloDetector:
             # Load the model
             self._load_model()
 
-            # Open the video stream - don't fail if stream isn't available yet
-            # We'll retry in the detection loop
+            # Open the video stream
             stream_opened = self._open_stream()
             if not stream_opened:
                 logger.warning(
-                    f"Could not open stream for {self.detector_id}, will retry in detection loop"
+                    f"Could not open stream for {self.detector_id}, will retry on next poll"
                 )
-
-            # Start detection thread
+                
+            # Start stream monitor thread to keep the stream connected
             self.stop_event.clear()
-            self.detection_thread = threading.Thread(target=self._detection_loop)
+            self.detection_thread = threading.Thread(target=self._stream_monitor_loop)
             if self.detection_thread:  # Type checking validation
                 self.detection_thread.daemon = True
                 self.detection_thread.start()
@@ -336,16 +335,22 @@ class YoloDetector:
                 self.cap = None
             return False
 
-    def _detection_loop(self) -> None:
-        """Main detection loop."""
-        logger.info(f"Starting detection loop for {self.detector_id}")
+    def _stream_monitor_loop(self) -> None:
+        """
+        Stream monitor loop that keeps the connection alive but doesn't perform detection.
+        Detection will only happen on poll requests.
+        """
+        logger.info(f"Starting stream monitor for {self.detector_id}")
 
-        last_detection_time = 0
-        frame_skip_counter = 0
+        # How often to check the stream health
+        check_interval = 5  # seconds
+        
+        # When to try reading a frame to verify stream health
+        frame_check_interval = 30  # seconds
+        last_frame_check = 0
 
         while not self.stop_event.is_set():
             try:
-                # Check if we should process a frame based on detection interval
                 current_time = time.time()
 
                 # If we've been idle too long, shut down the detector
@@ -355,12 +360,6 @@ class YoloDetector:
                     )
                     self.stop_event.set()
                     break
-
-                # Only process frames at the specified interval
-                if current_time - last_detection_time < self.detection_interval:
-                    # Sleep for a short time to avoid busy waiting
-                    time.sleep(0.1)
-                    continue
 
                 # Make sure we have a valid capture device
                 if self.cap is None or not self.cap.isOpened():
@@ -415,133 +414,171 @@ class YoloDetector:
 
                     continue
 
-                # Read frame from the video stream
-                ret, frame = self.cap.read()
-
-                if not ret or frame is None:
-                    logger.warning(
-                        f"Failed to read frame from stream for {self.detector_id}"
-                    )
-                    self.connection_status = "error"
-                    # Try to reconnect
-                    if self._open_stream():
-                        logger.info(
-                            "Successfully reconnected to stream after frame read error"
+                # Periodically check if the stream is still healthy by reading a frame
+                if current_time - last_frame_check > frame_check_interval:
+                    # Try to read a frame just to verify connection is still working
+                    ret, frame = self.cap.read()
+                    
+                    if not ret or frame is None:
+                        logger.warning(
+                            f"Failed to read frame from stream during health check for {self.detector_id}"
                         )
+                        self.connection_status = "error"
+                        # Try to reconnect
+                        if self._open_stream():
+                            logger.info(
+                                "Successfully reconnected to stream after health check failure"
+                            )
+                            self.connection_status = "connected"
+                        else:
+                            # Skip this iteration and try again later
+                            time.sleep(check_interval)
+                            continue
+                    else:
+                        # Stream is healthy
                         self.connection_status = "connected"
-                    # Skip this iteration
-                    time.sleep(1)
-                    continue
+                        # Store the most recent frame for potential use in detection
+                        self.last_frame = frame.copy()
+                        logger.debug(f"Stream health check passed for {self.detector_id}")
+                        
+                    # Update the last health check time
+                    last_frame_check = current_time
 
-                # Update connection status
-                self.connection_status = "connected"
-
-                # Increment frame counter
-                self.frame_count += 1
-
-                # Skip frames according to frame_skip_rate
-                frame_skip_counter += 1
-                if frame_skip_counter % self.frame_skip_rate != 0:
-                    continue
-
-                # Resize frame for model input
-                frame_resized = cv2.resize(frame, (self.input_width, self.input_height))
-
-                # Only perform detection at the specified interval
-                if current_time - last_detection_time >= self.detection_interval:
-                    # Store the most recent frame
-                    self.last_frame = frame.copy()
-
-                    # Perform detection
-                    results = self.model(frame_resized, conf=self.confidence_threshold)
-
-                    # Process results
-                    people_detected = False
-                    pets_detected = False
-                    people_count = 0
-                    pet_count = 0
-
-                    if len(results) > 0:
-                        # Extract detections - YOLO v8 format
-                        result = results[0]  # First batch result
-
-                        # Get boxes and class information
-                        boxes = result.boxes
-
-                        for box in boxes:
-                            cls_id = int(box.cls.item())
-                            _ = box.conf.item()  # Confidence value, unused
-
-                            # Only process supported classes
-                            if cls_id in SUPPORTED_CLASSES:
-                                if cls_id == 0:  # Person
-                                    people_detected = True
-                                    people_count += 1
-                                elif cls_id in [15, 16, 17]:  # Bird, cat, dog
-                                    pets_detected = True
-                                    pet_count += 1
-
-                    # Update detection state
-                    self.people_detected = people_detected
-                    self.pets_detected = pets_detected
-                    self.people_count = people_count
-                    self.pet_count = pet_count
-                    self.last_detection_time = current_time
-                    self.last_update_time = current_time
-
-                    # Log detection
-                    logger.debug(
-                        f"Detection: people={people_detected}({people_count}), pets={pets_detected}({pet_count})"
-                    )
-
-                    # Reset error counters on successful detection
-                    self.consecutive_errors = 0
-
-                    last_detection_time = current_time
-
-            except torch.cuda.OutOfMemoryError as cuda_err:
-                logger.error(f"CUDA out of memory error: {cuda_err}")
-                self.error_counts["cuda"] += 1
-                self.consecutive_errors += 1
-                time.sleep(self.error_recovery_delay)
-
-            except MemoryError as mem_err:
-                logger.error(f"Memory error: {mem_err}")
-                self.error_counts["memory"] += 1
-                self.consecutive_errors += 1
-                time.sleep(self.error_recovery_delay)
+                # Sleep before next check
+                time.sleep(check_interval)
 
             except cv2.error as cv_err:
-                logger.error(f"OpenCV error: {cv_err}")
+                logger.error(f"OpenCV error in stream monitor: {cv_err}")
                 self.error_counts["stream"] += 1
-                self.consecutive_errors += 1
                 # Try to reconnect to the stream
                 self._open_stream()
                 time.sleep(self.error_recovery_delay)
 
             except Exception as ex:
-                logger.error(f"Error in detection loop: {ex}", exc_info=True)
+                logger.error(f"Error in stream monitor: {ex}", exc_info=True)
                 self.error_counts["other"] += 1
-                self.consecutive_errors += 1
                 time.sleep(self.error_recovery_delay)
-
-            # Check if we need to apply error recovery
-            if self.consecutive_errors >= self.max_consecutive_errors:
-                logger.warning(
-                    f"Too many consecutive errors ({self.consecutive_errors}), applying recovery measures"
-                )
-
-                # Try to reconnect to the stream
-                self._open_stream()
-
-                # Reset error counter
-                self.consecutive_errors = 0
-
-                # Sleep for a longer time
-                time.sleep(10)
+                
+                # Check if we need to apply error recovery
+                if self.consecutive_errors >= self.max_consecutive_errors:
+                    logger.warning(
+                        f"Too many consecutive errors ({self.consecutive_errors}), applying recovery measures"
+                    )
+                    # Try to reconnect to the stream
+                    self._open_stream()
+                    # Reset error counter
+                    self.consecutive_errors = 0
+                    # Sleep for a longer time
+                    time.sleep(10)
 
         # Clean up when thread exits
         self._cleanup()
+        
+    def perform_detection(self) -> bool:
+        """
+        Perform detection on the current frame.
+        This is called on each poll request rather than continuously.
+        
+        Returns:
+            bool: True if detection was successful, False otherwise
+        """
+        if not self.is_running or self.cap is None or not self.cap.isOpened():
+            logger.warning(f"Cannot perform detection: detector {self.detector_id} not ready")
+            return False
+            
+        try:
+            # Read frame from the video stream
+            ret, frame = self.cap.read()
+            
+            if not ret or frame is None:
+                logger.warning(f"Failed to read frame for detection from {self.detector_id}")
+                
+                # Try to reconnect
+                if not self._open_stream():
+                    return False
+                    
+                # Try one more time to read a frame
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    logger.error(f"Failed to read frame after reconnection for {self.detector_id}")
+                    return False
+                    
+            # Store the frame
+            self.last_frame = frame.copy()
+            
+            # Update connection status
+            self.connection_status = "connected"
+            
+            # Increment frame counter
+            self.frame_count += 1
+            
+            # Resize frame for model input
+            frame_resized = cv2.resize(frame, (self.input_width, self.input_height))
+            
+            # Perform detection
+            results = self.model(frame_resized, conf=self.confidence_threshold)
+            
+            # Process results
+            people_detected = False
+            pets_detected = False
+            people_count = 0
+            pet_count = 0
+            
+            if len(results) > 0:
+                # Extract detections - YOLO v8 format
+                result = results[0]  # First batch result
+                
+                # Get boxes and class information
+                boxes = result.boxes
+                
+                for box in boxes:
+                    cls_id = int(box.cls.item())
+                    confidence = box.conf.item()
+                    
+                    # Only process supported classes with sufficient confidence
+                    if cls_id in SUPPORTED_CLASSES and confidence >= self.confidence_threshold:
+                        if cls_id == 0:  # Person
+                            people_detected = True
+                            people_count += 1
+                        elif cls_id in [15, 16, 17]:  # Bird, cat, dog
+                            pets_detected = True
+                            pet_count += 1
+            
+            # Update detection state
+            self.people_detected = people_detected
+            self.pets_detected = pets_detected
+            self.people_count = people_count
+            self.pet_count = pet_count
+            self.last_detection_time = time.time()
+            self.last_update_time = time.time()
+            
+            # Log detection
+            logger.info(
+                f"Detection for {self.detector_id}: people={people_detected}({people_count}), "
+                f"pets={pets_detected}({pet_count})"
+            )
+            
+            return True
+            
+        except torch.cuda.OutOfMemoryError as cuda_err:
+            logger.error(f"CUDA out of memory error during detection: {cuda_err}")
+            self.error_counts["cuda"] += 1
+            return False
+            
+        except MemoryError as mem_err:
+            logger.error(f"Memory error during detection: {mem_err}")
+            self.error_counts["memory"] += 1
+            return False
+            
+        except cv2.error as cv_err:
+            logger.error(f"OpenCV error during detection: {cv_err}")
+            self.error_counts["stream"] += 1
+            return False
+            
+        except Exception as ex:
+            logger.error(f"Error during detection: {ex}", exc_info=True)
+            self.error_counts["other"] += 1
+            return False
 
     def _cleanup(self) -> None:
         """Clean up resources."""
@@ -1015,7 +1052,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
         body = self._parse_json_body()
 
         if path == "/poll":
-            # Poll endpoint - create or update detector and get state
+            # Poll endpoint - create or update detector, perform detection, and get state
             detector_id = body.get("detector_id")
 
             if not detector_id:
@@ -1024,9 +1061,29 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
 
             # Get detector configuration from request
             config = body.get("config", {})
-
+            
             # Create or update detector
             result = create_or_update_detector(detector_id, config)
+            
+            # If detector is successfully created/updated, perform detection
+            if result.get("status") == "success" and detector_id in detectors:
+                detector = detectors[detector_id]
+                
+                # Perform detection on current frame
+                detection_start = time.time()
+                logger.info(f"Performing detection for {detector_id} on poll request")
+                detection_success = detector.perform_detection()
+                detection_time = time.time() - detection_start
+                
+                if detection_success:
+                    logger.info(f"Detection completed in {detection_time:.3f}s")
+                    # Get updated state after detection
+                    result["state"] = detector.get_state()
+                    result["detection_time"] = detection_time
+                else:
+                    logger.warning(f"Detection failed for {detector_id}")
+                    result["detection_failed"] = True
+            
             self._send_response(result)
 
         elif path == "/shutdown":
