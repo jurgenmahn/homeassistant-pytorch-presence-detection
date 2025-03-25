@@ -148,12 +148,16 @@ class YoloDetector:
     def initialize(self) -> bool:
         """Initialize the detector and start the detection process."""
         try:
-            detector_logger.info(f"Initializing YOLO Detector for {self.name}")
-            detector_logger.info(f"Stream URL: {self.stream_url}")
-            detector_logger.info(f"Model: {self.model_name}")
-            detector_logger.info(f"Input size: {self.input_width}x{self.input_height}")
-            detector_logger.info(f"Detection interval: {self.detection_interval}s")
-            detector_logger.info(f"Confidence threshold: {self.confidence_threshold}")
+            detector_logger.info("="*50)
+            detector_logger.info(f"INITIALIZING DETECTOR: {self.name} (ID: {self.detector_id})")
+            detector_logger.info("="*50)
+            detector_logger.info(f"Configuration:")
+            detector_logger.info(f"  - Stream URL: {self.stream_url}")
+            detector_logger.info(f"  - Model: {self.model_name}")
+            detector_logger.info(f"  - Input size: {self.input_width}x{self.input_height}")
+            detector_logger.info(f"  - Detection interval: {self.detection_interval}s")
+            detector_logger.info(f"  - Confidence threshold: {self.confidence_threshold}")
+            detector_logger.info(f"  - Frame skip rate: {self.frame_skip_rate}")
             
             # Load the YOLO model
             self._load_model()
@@ -161,7 +165,7 @@ class YoloDetector:
             # Create output directory for debug frames
             self.debug_frames_dir = os.path.join(os.getcwd(), "debug_frames", self.detector_id)
             os.makedirs(self.debug_frames_dir, exist_ok=True)
-            detector_logger.info(f"Debug frames will be saved to {self.debug_frames_dir}")
+            detector_logger.info(f"Debug frames directory: {self.debug_frames_dir}")
             
             # Start the detection process
             self.detection_thread = threading.Thread(target=self._detection_loop)
@@ -248,8 +252,24 @@ class YoloDetector:
             
             self.model = model
             self.device = device
+            
+            # Log detailed model information
+            detector_logger.info("----- MODEL INFORMATION -----")
+            detector_logger.info(f"Model: {self.model_name}")
+            detector_logger.info(f"Device: {self.device}")
+            detector_logger.info(f"Input size: {self.input_width}x{self.input_height}")
+            
+            # Display model details if available
+            try:
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'names'):
+                    detector_logger.info(f"Model classes: {self.model.model.names}")
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml'):
+                    detector_logger.info(f"Model architecture: {self.model.model.yaml['backbone']['type']}")
+            except Exception as ex:
+                detector_logger.debug(f"Could not get detailed model information: {ex}")
+                
             detector_logger.info(
-                f"YOLO model {self.model_name} loaded on {self.device} with input size {self.input_width}x{self.input_height}"
+                f"YOLO model {self.model_name} successfully loaded on {self.device} with input size {self.input_width}x{self.input_height}"
             )
 
     def _open_stream(self) -> bool:
@@ -1817,48 +1837,98 @@ def main() -> None:
     # Print banner
     print("\n" + "=" * 80)
     print("YOLO Presence Detection Server")
-    print("Version 1.0")
+    print("Version 1.1")
     print("=" * 80 + "\n")
     
-    logger.info("Starting YOLO Presence Detection Server")
+    logger.info("="*50)
+    logger.info("STARTING YOLO PRESENCE DETECTION SERVER")
+    logger.info("="*50)
     
-    # Print debug information about the environment
-    logger.info("Python version: " + sys.version)
-    logger.info("OpenCV version: " + cv2.__version__)
-    logger.info("PyTorch version: " + torch.__version__)
+    # Print detailed system information
+    logger.info("----- SYSTEM INFORMATION -----")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"OpenCV version: {cv2.__version__}")
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"Operating system: {os.name} - {sys.platform}")
+    logger.info(f"CPU cores: {os.cpu_count()}")
     
-    # Check for GPU availability
+    # Print network information
+    logger.info("----- NETWORK INFORMATION -----")
+    try:
+        import socket
+        hostname = socket.gethostname()
+        logger.info(f"Hostname: {hostname}")
+        logger.info(f"IP address: {socket.gethostbyname(hostname)}")
+        logger.info(f"TCP server port: {TCP_PORT}")
+    except Exception as ex:
+        logger.warning(f"Could not determine network information: {ex}")
+    
+    # Check for GPU availability with detailed info
+    logger.info("----- GPU INFORMATION -----")
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         device_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
-        logger.info(f"CUDA available, {gpu_count} device(s): {', '.join(device_names)}")
+        logger.info(f"CUDA available: YES")
+        logger.info(f"CUDA version: {torch.version.cuda if hasattr(torch.version, 'cuda') else 'Unknown'}")
+        logger.info(f"GPU devices: {gpu_count}")
+        for i in range(gpu_count):
+            device_name = torch.cuda.get_device_name(i)
+            logger.info(f"  - GPU {i}: {device_name}")
+            try:
+                mem_total = torch.cuda.get_device_properties(i).total_memory
+                logger.info(f"    Memory: {mem_total / (1024**3):.2f} GB")
+            except:
+                logger.info(f"    Memory: Unknown")
     else:
-        logger.warning("CUDA not available, using CPU only")
+        # Check for ROCm/AMD GPU
+        if hasattr(torch.backends, "hip") and hasattr(torch.backends.hip, "is_built") and torch.backends.hip.is_built():
+            logger.info(f"ROCm (AMD GPU) available: YES")
+            logger.info(f"Using ROCm for acceleration")
+        else:
+            logger.warning("GPU acceleration not available, using CPU only")
+    
+    # Print server configuration
+    logger.info("----- SERVER CONFIGURATION -----")
+    logger.info(f"Supported object classes: {[CLASS_MAP[cls] for cls in SUPPORTED_CLASSES]}")
+    logger.info(f"Max message size: 1MB")
+    logger.info(f"Socket read timeout: {30}s")
+    logger.info(f"Socket write timeout: {15}s")
     
     # Create debug frames directory in current working directory
     debug_dir = os.path.join(os.getcwd(), "debug_frames")
     os.makedirs(debug_dir, exist_ok=True)
-    logger.info(f"Debug frames will be saved to {debug_dir}")
+    logger.info(f"Debug frames directory: {debug_dir}")
     
     # Create config directory if it doesn't exist
     os.makedirs(DETECTORS_CONFIG_DIR, exist_ok=True)
-    logger.info(f"Detector configurations will be saved to {DETECTORS_CONFIG_DIR}")
-    logger.info(f"Detector config file path: {DETECTORS_CONFIG_FILE}")
+    logger.info(f"Detector configurations directory: {DETECTORS_CONFIG_DIR}")
+    logger.info(f"Detector configuration file: {DETECTORS_CONFIG_FILE}")
     logger.info(f"Current working directory: {os.getcwd()}")
     
-    # Print directory permissions
+    # Check for available YOLO models
+    logger.info("----- AVAILABLE MODELS -----")
+    model_locations = [".", "models", "/app/models"]
+    for location in model_locations:
+        if os.path.isdir(location):
+            model_files = [f for f in os.listdir(location) if f.endswith('.pt')]
+            if model_files:
+                logger.info(f"Models in {location}: {', '.join(model_files)}")
+    
+    # Check for available disk space
+    logger.info("----- DISK SPACE -----")
     try:
-        directory_info = os.stat(DETECTORS_CONFIG_DIR)
-        logger.info(f"Config directory permissions: {oct(directory_info.st_mode)}")
+        disk_usage = check_disk_space()
+        disk_free = 100 - disk_usage
+        logger.info(f"Disk usage: {disk_usage:.1f}% (Free: {disk_free:.1f}%)")
     except Exception as ex:
-        logger.error(f"Error checking config directory permissions: {ex}")
+        logger.warning(f"Could not check disk space: {ex}")
     
     # Force debug logging for detector module
     detector_logger.setLevel(logging.DEBUG)
     
-    # Print a direct DEBUG message to test logging
-    detector_logger.debug("This is a test DEBUG message from detector - if you see this, debug logging is working")
-    detector_logger.info("This is a test INFO message from detector")
+    logger.info("="*50)
+    logger.info("SERVER INITIALIZATION COMPLETE")
+    logger.info("="*50)
     
     # Set up signal handling
     handle_signals()
