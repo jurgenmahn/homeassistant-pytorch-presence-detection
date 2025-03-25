@@ -209,21 +209,46 @@ class YoloDetector:
             # Use gstreamer for RTSP streams if CUDA is available
             if self.stream_url.startswith("rtsp://") and self.device.startswith("cuda"):
                 logger.info("Using GStreamer pipeline for hardware acceleration")
-                gst_pipeline = (
-                    f"rtspsrc location={self.stream_url} latency=0 ! rtph264depay ! "
-                    f"h264parse ! nvv4l2decoder ! nvvidconv ! "
-                    f"video/x-raw, format=BGRx ! videoconvert ! "
-                    f"video/x-raw, format=BGR ! appsink drop=true"
-                )
-                self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                try:
+                    # Try with NVIDIA hardware acceleration first
+                    gst_pipeline = (
+                        f"rtspsrc location={self.stream_url} latency=0 ! rtph264depay ! "
+                        f"h264parse ! nvv4l2decoder ! nvvidconv ! "
+                        f"video/x-raw, format=BGRx ! videoconvert ! "
+                        f"video/x-raw, format=BGR ! appsink drop=true"
+                    )
+                    self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                    
+                    # If failed to open, try with generic hardware acceleration
+                    if not self.cap.isOpened():
+                        logger.warning("NVIDIA hardware acceleration failed, trying generic GStreamer pipeline")
+                        gst_pipeline = (
+                            f"rtspsrc location={self.stream_url} latency=0 ! rtph264depay ! "
+                            f"h264parse ! avdec_h264 ! videoconvert ! "
+                            f"video/x-raw, format=BGR ! appsink drop=true"
+                        )
+                        self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                except Exception as ex:
+                    logger.error(f"GStreamer pipeline error: {ex}")
+                    # Fall back to default OpenCV capture
+                    self.cap = cv2.VideoCapture(self.stream_url)
             else:
-                # Use default OpenCV capture
-                self.cap = cv2.VideoCapture(self.stream_url)
-
-                # Configure capture parameters
-                self.cap.set(
-                    cv2.CAP_PROP_BUFFERSIZE, 3
-                )  # Small buffer to reduce latency
+                logger.info("Using default OpenCV capture")
+                # Prepare RTSP options for better network resilience
+                if self.stream_url.startswith("rtsp://"):
+                    logger.info("Setting RTSP connection parameters for better reliability")
+                    # Use OpenCV capture with RTSP transport options
+                    self.cap = cv2.VideoCapture(self.stream_url)
+                    
+                    # Set RTSP transport to TCP instead of UDP for more reliability
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Small buffer to reduce latency
+                    self.cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 0)  # Use TCP (0=TCP, 1=UDP)
+                    self.cap.set(cv2.CAP_PROP_FPS, 15)  # Request lower FPS for better streaming
+                else:
+                    # Use default OpenCV capture for non-RTSP streams
+                    self.cap = cv2.VideoCapture(self.stream_url)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Small buffer to reduce latency
 
             # Check if stream is opened successfully
             if not self.cap.isOpened():
@@ -277,13 +302,33 @@ class YoloDetector:
                         > self.max_stream_reconnect_attempts
                     ):
                         logger.error(
-                            f"Max reconnection attempts reached for {self.detector_id}"
+                            f"Max reconnection attempts ({self.max_stream_reconnect_attempts}) reached for {self.detector_id}"
                         )
                         self.connection_status = "error"
-                        # Sleep for a longer time before trying again
-                        time.sleep(30)
+                        
+                        # Reset counter but use exponential backoff for next attempt series
+                        time.sleep(min(30 * (self.stream_reconnect_attempts // self.max_stream_reconnect_attempts), 300))
+                        logger.info(f"Resetting reconnection attempts counter and trying again")
                         self.stream_reconnect_attempts = 0
                     else:
+                        # Calculate progressive backoff delay
+                        current_delay = self.stream_reconnect_delay * (2 ** (self.stream_reconnect_attempts - 1))
+                        current_delay = min(current_delay, 30)  # Cap at 30 seconds
+                        
+                        logger.info(f"Reconnection attempt {self.stream_reconnect_attempts}/{self.max_stream_reconnect_attempts} " +
+                                    f"with {current_delay:.1f}s delay")
+                        
+                        # Close existing capture if any
+                        if self.cap is not None:
+                            try:
+                                self.cap.release()
+                                self.cap = None
+                            except Exception:
+                                pass
+                        
+                        # Wait before attempting reconnection
+                        time.sleep(current_delay)
+                        
                         # Try to reopen the stream
                         if self._open_stream():
                             logger.info(
@@ -292,8 +337,7 @@ class YoloDetector:
                             self.connection_status = "connected"
                             self.stream_reconnect_attempts = 0
                         else:
-                            # Sleep before next attempt
-                            time.sleep(self.stream_reconnect_delay)
+                            logger.warning(f"Reconnection attempt {self.stream_reconnect_attempts} failed")
 
                     continue
 
