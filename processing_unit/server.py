@@ -20,6 +20,27 @@ from urllib.parse import parse_qs, urlparse
 
 import cv2
 import torch
+try:
+    import psutil
+except ImportError:
+    # If psutil is not available, create a dummy implementation
+    class DummyPsutil:
+        @staticmethod
+        def cpu_percent(*args, **kwargs):
+            return 50.0  # Return a default value
+        
+        @staticmethod
+        def disk_usage(path):
+            class DummyDiskUsage:
+                total = 100
+                used = 50
+                free = 50
+                percent = 50.0
+            return DummyDiskUsage()
+    
+    psutil = DummyPsutil()
+    logging.warning("psutil not available, using dummy implementation")
+
 from ultralytics import YOLO
 
 # Configure logging
@@ -587,45 +608,195 @@ def create_or_update_detector(
 ) -> Dict[str, Any]:
     """Create or update a detector with the given configuration."""
     with detector_lock:
+        # Check for auto-configuration mode
+        auto_config = config.get("auto_config", False)
+        
         if detector_id in detectors:
             # Update existing detector
             detector = detectors[detector_id]
             logger.info(f"Updating existing detector {detector_id}")
+            
+            settings_changed = False
+            
+            # Track which settings are being updated
+            updated_settings = []
 
             # Update detector configuration
-            if config.get("stream_url"):
+            if config.get("stream_url") and config["stream_url"] != detector.stream_url:
                 detector.stream_url = config["stream_url"]
-            if config.get("name"):
+                updated_settings.append("stream_url")
+                # Stream URL change requires reconnection
+                settings_changed = True
+                
+            if config.get("name") and config["name"] != detector.name:
                 detector.name = config["name"]
-            if config.get("model"):
-                # Model changes require reinitialization, which we'll skip here
+                updated_settings.append("name")
+                
+            if config.get("model") and config["model"] != detector.model_name:
+                # Model changes require reinitialization, which we'll log but not actually reinitialize
                 detector.model_name = config["model"]
+                updated_settings.append("model (requires restart)")
+                
             if config.get("input_size"):
                 try:
                     width, height = map(int, config["input_size"].split("x"))
-                    detector.input_width = width
-                    detector.input_height = height
-                except Exception:
-                    pass
-            if config.get("detection_interval"):
-                detector.detection_interval = config["detection_interval"]
-            if config.get("confidence_threshold"):
-                detector.confidence_threshold = config["confidence_threshold"]
-            if config.get("frame_skip_rate"):
-                detector.frame_skip_rate = config["frame_skip_rate"]
+                    if width != detector.input_width or height != detector.input_height:
+                        detector.input_width = width
+                        detector.input_height = height
+                        updated_settings.append("input_size")
+                except Exception as ex:
+                    logger.warning(f"Invalid input_size format: {config.get('input_size')} - {ex}")
+                    
+            if config.get("detection_interval") is not None:
+                try:
+                    interval = float(config["detection_interval"])
+                    if interval != detector.detection_interval:
+                        detector.detection_interval = interval
+                        updated_settings.append("detection_interval")
+                except Exception as ex:
+                    logger.warning(f"Invalid detection_interval: {config.get('detection_interval')} - {ex}")
+                    
+            if config.get("confidence_threshold") is not None:
+                try:
+                    threshold = float(config["confidence_threshold"])
+                    if threshold != detector.confidence_threshold:
+                        detector.confidence_threshold = threshold
+                        updated_settings.append("confidence_threshold")
+                except Exception as ex:
+                    logger.warning(f"Invalid confidence_threshold: {config.get('confidence_threshold')} - {ex}")
+                    
+            if config.get("frame_skip_rate") is not None:
+                try:
+                    skip_rate = int(config["frame_skip_rate"])
+                    if skip_rate != detector.frame_skip_rate:
+                        detector.frame_skip_rate = skip_rate
+                        updated_settings.append("frame_skip_rate")
+                except Exception as ex:
+                    logger.warning(f"Invalid frame_skip_rate: {config.get('frame_skip_rate')} - {ex}")
+                    
+            # Auto configure if requested
+            if auto_config:
+                # Determine if we need performance optimization or quality improvement based on resources
+                try:
+                    # Check CPU/GPU usage
+                    cpu_usage = psutil.cpu_percent()
+                    
+                    if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
+                        gpu_usage = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory * 100
+                    else:
+                        gpu_usage = 0
+                        
+                    # Get current connection status
+                    connection_ok = detector.connection_status == "connected"
+                    
+                    if not connection_ok:
+                        # Connection issues - reduce quality for better streaming
+                        if detector.frame_skip_rate < 10:
+                            detector.frame_skip_rate += 1
+                            updated_settings.append("frame_skip_rate (auto increased)")
+                            
+                        if detector.detection_interval < 20:
+                            detector.detection_interval += 2
+                            updated_settings.append("detection_interval (auto increased)")
+                            
+                    elif cpu_usage > 80 or gpu_usage > 80:
+                        # High resource usage - reduce quality
+                        if detector.frame_skip_rate < 8:
+                            detector.frame_skip_rate += 1
+                            updated_settings.append("frame_skip_rate (auto increased)")
+                            
+                        if detector.detection_interval < 15:
+                            detector.detection_interval += 1
+                            updated_settings.append("detection_interval (auto increased)")
+                    elif cpu_usage < 40 and gpu_usage < 40:
+                        # Low resource usage - increase quality
+                        if detector.frame_skip_rate > 2:
+                            detector.frame_skip_rate -= 1
+                            updated_settings.append("frame_skip_rate (auto decreased)")
+                            
+                        if detector.detection_interval > 3:
+                            detector.detection_interval -= 1
+                            updated_settings.append("detection_interval (auto decreased)")
+                            
+                    # Log auto configuration changes 
+                    if updated_settings:
+                        logger.info(f"Auto-configured detector {detector_id}: {', '.join(updated_settings)}")
+                        
+                except Exception as ex:
+                    logger.warning(f"Auto-configuration error: {ex}")
 
             # Update last client request time to prevent idle shutdown
             detector.last_client_request = time.time()
+            
+            # Log the updated settings
+            if updated_settings:
+                logger.info(f"Updated detector {detector_id} settings: {', '.join(updated_settings)}")
+                
+                # If stream URL changed, try to reconnect immediately
+                if "stream_url" in updated_settings and detector.is_running:
+                    logger.info(f"Stream URL changed, attempting to reconnect for {detector_id}")
+                    if detector._open_stream():
+                        logger.info(f"Successfully reconnected to new stream for {detector_id}")
+                    else:
+                        logger.warning(f"Failed to connect to new stream for {detector_id}, will retry in detection loop")
 
             return {
                 "status": "success",
-                "message": "Detector updated",
+                "message": f"Detector updated" + (f" ({', '.join(updated_settings)})" if updated_settings else ""),
                 "detector_id": detector_id,
                 "state": detector.get_state(),
             }
         else:
             # Create new detector
             logger.info(f"Creating new detector {detector_id}")
+            
+            # Apply default configuration if not provided
+            if not config.get("stream_url"):
+                logger.error(f"No stream URL provided for detector {detector_id}")
+                return {
+                    "status": "error",
+                    "message": "stream_url is required",
+                    "detector_id": detector_id,
+                }
+                
+            # Set default configuration if not provided
+            if not config.get("name"):
+                config["name"] = f"Detector {detector_id[:8]}"
+                
+            if not config.get("model"):
+                config["model"] = "yolo11l"
+                
+            if not config.get("input_size"):
+                config["input_size"] = "640x480"
+                
+            if not config.get("detection_interval"):
+                config["detection_interval"] = 10
+                
+            if not config.get("confidence_threshold"):
+                config["confidence_threshold"] = 0.25
+                
+            if not config.get("frame_skip_rate"):
+                config["frame_skip_rate"] = 5
+                
+            # Log the configuration being used
+            logger.info(f"Creating detector {detector_id} with configuration: {json.dumps({k: v for k, v in config.items() if k != 'stream_url'})}")
+            if "stream_url" in config:
+                masked_url = "[URL MASKED]"
+                try:
+                    url = config["stream_url"]
+                    if "@" in url:
+                        parsed = urllib.parse.urlparse(url)
+                        netloc = parsed.netloc
+                        if "@" in netloc:
+                            userpass, hostport = netloc.split("@", 1)
+                            if ":" in userpass:
+                                user, _ = userpass.split(":", 1)
+                                masked_netloc = f"{user}:****@{hostport}"
+                                masked_url = f"{parsed.scheme}://{masked_netloc}{parsed.path}"
+                except:
+                    pass
+                logger.info(f"Stream URL: {masked_url}")
+                
             detector = YoloDetector(detector_id, config)
 
             if detector.initialize():
@@ -663,10 +834,69 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
 
     def _send_response(self, data: Dict[str, Any], status_code: int = 200) -> None:
         """Send a JSON response."""
+        # Prepare the response
+        response_json = json.dumps(data)
+        response_bytes = response_json.encode("utf-8")
+        
+        # Log the response
+        client_addr = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        
+        # Format the response for logging with some formatting
+        log_data = data
+        if isinstance(data, dict) and "state" in data:
+            # If this contains detector state, mask any sensitive stream URLs
+            state = data.get("state", {})
+            if isinstance(state, dict) and "stream_url" in state:
+                stream_url = state.get("stream_url", "")
+                if "@" in stream_url:
+                    # Parse and mask password
+                    parsed_url = urllib.parse.urlparse(stream_url)
+                    netloc = parsed_url.netloc
+                    if '@' in netloc:
+                        userpass, hostport = netloc.split('@', 1)
+                        if ':' in userpass:
+                            user, _ = userpass.split(':', 1)
+                            masked_netloc = f"{user}:****@{hostport}"
+                            masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                            # Create masked version for logging
+                            masked_state = state.copy()
+                            masked_state["stream_url"] = masked_url
+                            log_data = data.copy()
+                            log_data["state"] = masked_state
+        
+        # Log summary version or full version based on debug level
+        response_log = json.dumps(log_data, indent=2)
+        if len(response_log) > 1000:
+            # For large responses, log a summary version
+            if isinstance(data, dict):
+                summary = {"status": data.get("status")}
+                if "detector_id" in data:
+                    summary["detector_id"] = data.get("detector_id")
+                if "message" in data:
+                    summary["message"] = data.get("message")
+                if "state" in data and isinstance(data["state"], dict):
+                    state = data["state"]
+                    state_summary = {}
+                    for key in ["connection_status", "human_detected", "pet_detected", 
+                                "human_count", "pet_count", "is_running"]:
+                        if key in state:
+                            state_summary[key] = state[key]
+                    summary["state"] = state_summary
+                response_log = json.dumps(summary, indent=2)
+            else:
+                response_log = f"{response_log[:997]}..."
+            
+        logger.info(f"RESPONSE to {client_addr} - {request_method} {request_path} - Status: {status_code}")
+        logger.info(f"RESPONSE BODY: {response_log}")
+        
+        # Send the actual response
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
+        self.send_header("Content-Length", str(len(response_bytes)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(response_bytes)
 
     def _send_error_response(self, message: str, status_code: int = 400) -> None:
         """Send an error response."""
@@ -679,9 +909,50 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
             return {}
 
         try:
-            body = self.rfile.read(content_length).decode("utf-8")
-            return json.loads(body)
-        except json.JSONDecodeError:
+            body_raw = self.rfile.read(content_length).decode("utf-8")
+            
+            # Log the raw request body
+            client_addr = self.client_address[0]
+            request_method = self.command
+            request_path = self.path
+            logger.info(f"REQUEST from {client_addr} - {request_method} {request_path}")
+            
+            # Mask any password in stream URLs for security
+            body_log = body_raw
+            try:
+                # Parse the JSON
+                body_json = json.loads(body_raw)
+                
+                # If this contains a config with stream_url that has a password, mask it
+                if isinstance(body_json, dict) and "config" in body_json:
+                    config = body_json.get("config", {})
+                    if isinstance(config, dict) and "stream_url" in config:
+                        stream_url = config.get("stream_url", "")
+                        if "@" in stream_url:
+                            # Parse and mask password
+                            parsed_url = urllib.parse.urlparse(stream_url)
+                            netloc = parsed_url.netloc
+                            if '@' in netloc:
+                                userpass, hostport = netloc.split('@', 1)
+                                if ':' in userpass:
+                                    user, _ = userpass.split(':', 1)
+                                    masked_netloc = f"{user}:****@{hostport}"
+                                    masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                                    # Create a new masked JSON for logging
+                                    masked_config = config.copy()
+                                    masked_config["stream_url"] = masked_url
+                                    masked_body = body_json.copy()
+                                    masked_body["config"] = masked_config
+                                    body_log = json.dumps(masked_body, indent=2)
+            except:
+                # If any error in masking, just use the original but truncated
+                if len(body_log) > 1000:
+                    body_log = body_log[:997] + "..."
+            
+            logger.info(f"REQUEST BODY: {body_log}")
+            return json.loads(body_raw)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
             return {}
 
     def do_GET(self) -> None:
