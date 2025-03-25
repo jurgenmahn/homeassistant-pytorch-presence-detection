@@ -1,6 +1,6 @@
 {
   "domain": "yolo_presence",
-  "name": "Presence Detection from realtime camera feed (PyTorch/Yolo)",
+  "name": "ML - Video Presence Detection",
   "codeowners": ["@jurgenmahn"],
   "config_flow": true,
   "dependencies": [],

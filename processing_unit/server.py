@@ -952,72 +952,102 @@ def check_disk_space() -> float:
 
 class YoloHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for YOLO detectors."""
-
+    
+    # Add a more robust error handler
+    def handle_one_request(self) -> None:
+        """Handle a single HTTP request with improved error handling."""
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError) as e:
+            logger.warning(f"Connection error with client {self.client_address}: {e}")
+        except Exception as e:
+            logger.error(f"Error handling request from {self.client_address}: {e}", exc_info=True)
+    
     def _send_response(self, data: Dict[str, Any], status_code: int = 200) -> None:
         """Send a JSON response."""
-        # Prepare the response
-        response_json = json.dumps(data)
-        response_bytes = response_json.encode("utf-8")
-        
-        # Log the response
-        client_addr = self.client_address[0]
-        request_method = self.command
-        request_path = self.path
-        
-        # Format the response for logging with some formatting
-        log_data = data
-        if isinstance(data, dict) and "state" in data:
-            # If this contains detector state, mask any sensitive stream URLs
-            state = data.get("state", {})
-            if isinstance(state, dict) and "stream_url" in state:
-                stream_url = state.get("stream_url", "")
-                if "@" in stream_url:
-                    # Parse and mask password
-                    parsed_url = urllib.parse.urlparse(stream_url)
-                    netloc = parsed_url.netloc
-                    if '@' in netloc:
-                        userpass, hostport = netloc.split('@', 1)
-                        if ':' in userpass:
-                            user, _ = userpass.split(':', 1)
-                            masked_netloc = f"{user}:****@{hostport}"
-                            masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
-                            # Create masked version for logging
-                            masked_state = state.copy()
-                            masked_state["stream_url"] = masked_url
-                            log_data = data.copy()
-                            log_data["state"] = masked_state
-        
-        # Log summary version or full version based on debug level
-        response_log = json.dumps(log_data, indent=2)
-        if len(response_log) > 1000:
-            # For large responses, log a summary version
-            if isinstance(data, dict):
-                summary = {"status": data.get("status")}
-                if "detector_id" in data:
-                    summary["detector_id"] = data.get("detector_id")
-                if "message" in data:
-                    summary["message"] = data.get("message")
-                if "state" in data and isinstance(data["state"], dict):
-                    state = data["state"]
-                    state_summary = {}
-                    for key in ["connection_status", "human_detected", "pet_detected", 
-                                "human_count", "pet_count", "is_running"]:
-                        if key in state:
-                            state_summary[key] = state[key]
-                    summary["state"] = state_summary
-                response_log = json.dumps(summary, indent=2)
-            else:
-                response_log = f"{response_log[:997]}..."
+        try:
+            # Prepare the response
+            response_json = json.dumps(data)
+            response_bytes = response_json.encode("utf-8")
             
-        logger.info(f"RESPONSE to {client_addr} - {request_method} {request_path} - Status: {status_code}")
-        logger.info(f"RESPONSE BODY: {response_log}")
-        
-        # Send the actual response
-        self.send_response(status_code)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Content-Length", str(len(response_bytes)))
-        self.end_headers()
-        self.wfile.write(response_bytes)
+            # Log the response
+            client_addr = self.client_address[0]
+            request_method = self.command
+            request_path = self.path
+            
+            # Format the response for logging with some formatting
+            log_data = data
+            if isinstance(data, dict) and "state" in data:
+                # If this contains detector state, mask any sensitive stream URLs
+                state = data.get("state", {})
+                if isinstance(state, dict) and "stream_url" in state:
+                    stream_url = state.get("stream_url", "")
+                    if "@" in stream_url:
+                        # Parse and mask password
+                        parsed_url = urllib.parse.urlparse(stream_url)
+                        netloc = parsed_url.netloc
+                        if '@' in netloc:
+                            userpass, hostport = netloc.split('@', 1)
+                            if ':' in userpass:
+                                user, _ = userpass.split(':', 1)
+                                masked_netloc = f"{user}:****@{hostport}"
+                                masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                                # Create masked version for logging
+                                masked_state = state.copy()
+                                masked_state["stream_url"] = masked_url
+                                log_data = data.copy()
+                                log_data["state"] = masked_state
+            
+            # Log summary version or full version based on debug level
+            response_log = json.dumps(log_data, indent=2)
+            if len(response_log) > 1000:
+                # For large responses, log a summary version
+                if isinstance(data, dict):
+                    summary = {"status": data.get("status")}
+                    if "detector_id" in data:
+                        summary["detector_id"] = data.get("detector_id")
+                    if "message" in data:
+                        summary["message"] = data.get("message")
+                    if "state" in data and isinstance(data["state"], dict):
+                        state = data["state"]
+                        state_summary = {}
+                        for key in ["connection_status", "human_detected", "pet_detected", 
+                                    "human_count", "pet_count", "is_running"]:
+                            if key in state:
+                                state_summary[key] = state[key]
+                        summary["state"] = state_summary
+                    response_log = json.dumps(summary, indent=2)
+                else:
+                    response_log = f"{response_log[:997]}..."
+                
+            logger.info(f"RESPONSE to {client_addr} - {request_method} {request_path} - Status: {status_code}")
+            logger.info(f"RESPONSE BODY: {response_log}")
+            
+            # Send the actual response
+            try:
+                self.send_response(status_code)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", str(len(response_bytes)))
+                self.end_headers()
+                self.wfile.write(response_bytes)
+            except (BrokenPipeError, ConnectionResetError) as e:
+                logger.warning(f"Connection closed by client during response to {client_addr}: {e}")
+            except Exception as e:
+                logger.error(f"Error sending response to {client_addr}: {e}")
+        except Exception as e:
+            logger.error(f"Error preparing response: {e}", exc_info=True)
+            # Try to send a simple error response
+            try:
+                error_response = json.dumps({"status": "error", "message": "Internal server error"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", str(len(error_response)))
+                self.end_headers()
+                self.wfile.write(error_response)
+            except:
+                # Last resort - we can't send a response
+                logger.error("Failed to send error response")
+                pass
 
     def _send_error_response(self, message: str, status_code: int = 400) -> None:
         """Send an error response."""
@@ -1025,193 +1055,278 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
 
     def _parse_json_body(self) -> Dict[str, Any]:
         """Parse JSON request body."""
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            return {}
-
         try:
-            body_raw = self.rfile.read(content_length).decode("utf-8")
-            
-            # Log the raw request body
-            client_addr = self.client_address[0]
-            request_method = self.command
-            request_path = self.path
-            logger.info(f"REQUEST from {client_addr} - {request_method} {request_path}")
-            
-            # Mask any password in stream URLs for security
-            body_log = body_raw
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                return {}
+    
             try:
-                # Parse the JSON
-                body_json = json.loads(body_raw)
+                # Read the raw body data
+                try:
+                    body_raw = self.rfile.read(content_length).decode("utf-8")
+                except (ConnectionResetError, BrokenPipeError) as e:
+                    logger.warning(f"Connection closed by client while reading request body: {e}")
+                    return {}
                 
-                # If this contains a config with stream_url that has a password, mask it
-                if isinstance(body_json, dict) and "config" in body_json:
-                    config = body_json.get("config", {})
-                    if isinstance(config, dict) and "stream_url" in config:
-                        stream_url = config.get("stream_url", "")
-                        if "@" in stream_url:
-                            # Parse and mask password
-                            parsed_url = urllib.parse.urlparse(stream_url)
-                            netloc = parsed_url.netloc
-                            if '@' in netloc:
-                                userpass, hostport = netloc.split('@', 1)
-                                if ':' in userpass:
-                                    user, _ = userpass.split(':', 1)
-                                    masked_netloc = f"{user}:****@{hostport}"
-                                    masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
-                                    # Create a new masked JSON for logging
-                                    masked_config = config.copy()
-                                    masked_config["stream_url"] = masked_url
-                                    masked_body = body_json.copy()
-                                    masked_body["config"] = masked_config
-                                    body_log = json.dumps(masked_body, indent=2)
-            except:
-                # If any error in masking, just use the original but truncated
-                if len(body_log) > 1000:
-                    body_log = body_log[:997] + "..."
-            
-            logger.info(f"REQUEST BODY: {body_log}")
-            return json.loads(body_raw)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {e}")
+                # Log the raw request body
+                client_addr = self.client_address[0]
+                request_method = self.command
+                request_path = self.path
+                logger.info(f"REQUEST from {client_addr} - {request_method} {request_path}")
+                
+                # Mask any password in stream URLs for security
+                body_log = body_raw
+                try:
+                    # Parse the JSON
+                    body_json = json.loads(body_raw)
+                    
+                    # If this contains a config with stream_url that has a password, mask it
+                    if isinstance(body_json, dict) and "config" in body_json:
+                        config = body_json.get("config", {})
+                        if isinstance(config, dict) and "stream_url" in config:
+                            stream_url = config.get("stream_url", "")
+                            if "@" in stream_url:
+                                # Parse and mask password
+                                parsed_url = urllib.parse.urlparse(stream_url)
+                                netloc = parsed_url.netloc
+                                if '@' in netloc:
+                                    userpass, hostport = netloc.split('@', 1)
+                                    if ':' in userpass:
+                                        user, _ = userpass.split(':', 1)
+                                        masked_netloc = f"{user}:****@{hostport}"
+                                        masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                                        # Create a new masked JSON for logging
+                                        masked_config = config.copy()
+                                        masked_config["stream_url"] = masked_url
+                                        masked_body = body_json.copy()
+                                        masked_body["config"] = masked_config
+                                        body_log = json.dumps(masked_body, indent=2)
+                except Exception as mask_err:
+                    # If any error in masking, just use the original but truncated
+                    logger.debug(f"Error while masking credentials: {mask_err}")
+                    if len(body_log) > 1000:
+                        body_log = body_log[:997] + "..."
+                
+                logger.info(f"REQUEST BODY: {body_log}")
+                
+                try:
+                    return json.loads(body_raw)
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON parse error: {e}")
+                    logger.debug(f"Raw request body: {body_raw[:200]}")
+                    return {}
+            except Exception as read_err:
+                logger.error(f"Error reading request body: {read_err}")
+                return {}
+        except Exception as e:
+            logger.error(f"Unexpected error in _parse_json_body: {e}", exc_info=True)
             return {}
 
     def do_GET(self) -> None:
         """Handle GET requests."""
-        # Parse URL and query parameters
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path
-        query = parse_qs(parsed_url.query)
-
-        # Get detector_id from query parameters
-        detector_id = query.get("detector_id", [""])[0]
-
-        if path == "/health":
-            # Health check endpoint
-            self._send_response(
-                {
-                    "status": "ok",
-                    "message": "Server is running",
-                    "detector_count": len(detectors),
-                }
-            )
-        elif path == "/state" and detector_id:
-            # Get detector state
-            with detector_lock:
-                if detector_id in detectors:
-                    detector = detectors[detector_id]
-                    self._send_response(
-                        {
-                            "status": "success",
-                            "detector_id": detector_id,
-                            "state": detector.get_state(),
-                        }
-                    )
-                else:
-                    self._send_error_response(f"Detector {detector_id} not found", 404)
-        elif path == "/detectors":
-            # List all detectors
-            with detector_lock:
-                detector_list = []
-                for detector_id, detector in detectors.items():
-                    detector_list.append(
-                        {
-                            "detector_id": detector_id,
-                            "name": detector.name,
-                            "is_running": detector.is_running,
-                            "connection_status": detector.connection_status,
-                        }
-                    )
-                self._send_response({"status": "success", "detectors": detector_list})
-        else:
-            self._send_error_response("Invalid endpoint", 404)
+        try:
+            # Parse URL and query parameters
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+            query = parse_qs(parsed_url.query)
+    
+            # Get detector_id from query parameters
+            detector_id = query.get("detector_id", [""])[0]
+    
+            if path == "/health":
+                # Health check endpoint
+                self._send_response(
+                    {
+                        "status": "ok",
+                        "message": "Server is running",
+                        "detector_count": len(detectors),
+                    }
+                )
+            elif path == "/state" and detector_id:
+                # Get detector state
+                try:
+                    with detector_lock:
+                        if detector_id in detectors:
+                            detector = detectors[detector_id]
+                            self._send_response(
+                                {
+                                    "status": "success",
+                                    "detector_id": detector_id,
+                                    "state": detector.get_state(),
+                                }
+                            )
+                        else:
+                            self._send_error_response(f"Detector {detector_id} not found", 404)
+                except Exception as ex:
+                    logger.error(f"Error getting detector state: {ex}", exc_info=True)
+                    self._send_error_response(f"Error getting detector state: {str(ex)}", 500)
+            elif path == "/detectors":
+                # List all detectors
+                try:
+                    with detector_lock:
+                        detector_list = []
+                        for detector_id, detector in detectors.items():
+                            detector_list.append(
+                                {
+                                    "detector_id": detector_id,
+                                    "name": detector.name,
+                                    "is_running": detector.is_running,
+                                    "connection_status": detector.connection_status,
+                                }
+                            )
+                        self._send_response({"status": "success", "detectors": detector_list})
+                except Exception as ex:
+                    logger.error(f"Error listing detectors: {ex}", exc_info=True)
+                    self._send_error_response(f"Error listing detectors: {str(ex)}", 500)
+            else:
+                self._send_error_response("Invalid endpoint", 404)
+        except Exception as e:
+            logger.error(f"Unhandled exception in do_GET: {e}", exc_info=True)
+            try:
+                self._send_error_response(f"Internal server error", 500)
+            except:
+                logger.error("Failed to send error response", exc_info=True)
 
     def do_POST(self) -> None:
         """Handle POST requests."""
-        # Parse URL
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path
-
-        # Parse request body
-        body = self._parse_json_body()
-
-        if path == "/poll":
-            # Poll endpoint - create or update detector, perform detection, and get state
-            detector_id = body.get("detector_id")
-
-            if not detector_id:
-                self._send_error_response("detector_id is required")
-                return
-
-            # Get detector configuration from request
-            config = body.get("config", {})
-            
-            # Create or update detector
-            result = create_or_update_detector(detector_id, config)
-            
-            # If detector is successfully created/updated, perform detection
-            if result.get("status") == "success" and detector_id in detectors:
-                detector = detectors[detector_id]
-                
-                # Perform detection on current frame
-                detection_start = time.time()
-                logger.info(f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}")
-                detection_success = detector.perform_detection()
-                detection_time = time.time() - detection_start
-                
-                if detection_success:
-                    # Get the detailed detection information
-                    detection_info = ""
-                    if hasattr(detector, "detected_objects") and detector.detected_objects:
-                        items = [f"{count} {obj}" for obj, count in detector.detected_objects.items()]
-                        detection_info = f" - Found: {', '.join(items)}"
+        try:
+            # Parse URL
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+    
+            # Parse request body
+            body = self._parse_json_body()
+    
+            if path == "/poll":
+                try:
+                    # Poll endpoint - create or update detector, perform detection, and get state
+                    detector_id = body.get("detector_id")
+    
+                    if not detector_id:
+                        self._send_error_response("detector_id is required")
+                        return
+    
+                    # Get detector configuration from request
+                    config = body.get("config", {})
                     
-                    # Log with additional info
-                    logger.info(
-                        f"Detection completed in {detection_time:.3f}s for {detector_id}{detection_info}"
-                    )
-                    
-                    # Get updated state after detection
-                    result["state"] = detector.get_state()
-                    result["detection_time"] = detection_time
-                else:
-                    logger.warning(f"Detection failed for {detector_id}")
-                    result["detection_failed"] = True
-            
-            self._send_response(result)
-
-        elif path == "/shutdown":
-            # Shutdown detector
-            detector_id = body.get("detector_id")
-
-            if not detector_id:
-                self._send_error_response("detector_id is required")
-                return
-
-            with detector_lock:
-                if detector_id in detectors:
-                    detector = detectors[detector_id]
-                    detector.shutdown()
-                    del detectors[detector_id]
-                    self._send_response(
-                        {
-                            "status": "success",
-                            "message": f"Detector {detector_id} shutdown",
-                        }
-                    )
-                else:
-                    self._send_error_response(f"Detector {detector_id} not found", 404)
-        else:
-            self._send_error_response("Invalid endpoint", 404)
+                    try:
+                        # Create or update detector
+                        result = create_or_update_detector(detector_id, config)
+                        
+                        # If detector is successfully created/updated, perform detection
+                        if result.get("status") == "success" and detector_id in detectors:
+                            try:
+                                detector = detectors[detector_id]
+                                
+                                # Perform detection on current frame
+                                detection_start = time.time()
+                                logger.info(f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}")
+                                
+                                try:
+                                    detection_success = detector.perform_detection()
+                                    detection_time = time.time() - detection_start
+                                    
+                                    if detection_success:
+                                        # Get the detailed detection information
+                                        detection_info = ""
+                                        if hasattr(detector, "detected_objects") and detector.detected_objects:
+                                            items = [f"{count} {obj}" for obj, count in detector.detected_objects.items()]
+                                            detection_info = f" - Found: {', '.join(items)}"
+                                        
+                                        # Log with additional info
+                                        logger.info(
+                                            f"Detection completed in {detection_time:.3f}s for {detector_id}{detection_info}"
+                                        )
+                                        
+                                        # Get updated state after detection
+                                        result["state"] = detector.get_state()
+                                        result["detection_time"] = detection_time
+                                    else:
+                                        logger.warning(f"Detection failed for {detector_id}")
+                                        result["detection_failed"] = True
+                                        
+                                except Exception as detection_err:
+                                    logger.error(f"Error during detection for {detector_id}: {detection_err}", exc_info=True)
+                                    result["status"] = "error"
+                                    result["message"] = f"Detection error: {str(detection_err)}"
+                                    result["detection_failed"] = True
+                            except Exception as detector_err:
+                                logger.error(f"Error accessing detector {detector_id}: {detector_err}", exc_info=True)
+                                result["status"] = "error"
+                                result["message"] = f"Detector access error: {str(detector_err)}"
+                        
+                        self._send_response(result)
+                    except Exception as create_err:
+                        logger.error(f"Error creating/updating detector {detector_id}: {create_err}", exc_info=True)
+                        self._send_error_response(f"Error creating/updating detector: {str(create_err)}", 500)
+                except Exception as poll_err:
+                    logger.error(f"Error processing poll request: {poll_err}", exc_info=True)
+                    self._send_error_response(f"Error processing poll request: {str(poll_err)}", 500)
+    
+            elif path == "/shutdown":
+                try:
+                    # Shutdown detector
+                    detector_id = body.get("detector_id")
+    
+                    if not detector_id:
+                        self._send_error_response("detector_id is required")
+                        return
+    
+                    with detector_lock:
+                        if detector_id in detectors:
+                            try:
+                                detector = detectors[detector_id]
+                                detector.shutdown()
+                                del detectors[detector_id]
+                                self._send_response(
+                                    {
+                                        "status": "success",
+                                        "message": f"Detector {detector_id} shutdown",
+                                    }
+                                )
+                            except Exception as shutdown_err:
+                                logger.error(f"Error shutting down detector {detector_id}: {shutdown_err}", exc_info=True)
+                                self._send_error_response(f"Error shutting down detector: {str(shutdown_err)}", 500)
+                        else:
+                            self._send_error_response(f"Detector {detector_id} not found", 404)
+                except Exception as shutdown_req_err:
+                    logger.error(f"Error processing shutdown request: {shutdown_req_err}", exc_info=True)
+                    self._send_error_response(f"Error processing shutdown request: {str(shutdown_req_err)}", 500)
+            else:
+                self._send_error_response("Invalid endpoint", 404)
+        except Exception as e:
+            logger.error(f"Unhandled exception in do_POST: {e}", exc_info=True)
+            try:
+                self._send_error_response(f"Internal server error", 500)
+            except:
+                logger.error("Failed to send error response", exc_info=True)
 
 
 def start_http_server() -> None:
     """Start the HTTP server."""
+    server = None
     try:
-        server = HTTPServer(("0.0.0.0", HTTP_PORT), YoloHTTPHandler)
+        # Customize the HTTP server for better error handling
+        class RobustHTTPServer(HTTPServer):
+            """Enhanced HTTP server with improved error handling."""
+            
+            def handle_error(self, request, client_address):
+                """Handle errors occurring during request processing."""
+                # Extract the client IP
+                client_ip = client_address[0] if client_address else "unknown"
+                
+                # Log the error with traceback
+                logger.error(f"Error processing request from {client_ip}:", exc_info=True)
+                
+                # Don't close the socket on errors
+                return
+        
+        # Create the server with robust error handling
+        server = RobustHTTPServer(("0.0.0.0", HTTP_PORT), YoloHTTPHandler)
+        server.timeout = 60  # Set a timeout for socket operations
+        
+        # Log server startup information
         logger.info(f"Starting HTTP server on port {HTTP_PORT}")
-
-        # Print server info
         logger.info(f"Python version: {sys.version}")
         logger.info(f"OpenCV version: {cv2.__version__}")
         logger.info(f"PyTorch version: {torch.__version__}")
@@ -1220,22 +1335,47 @@ def start_http_server() -> None:
         if torch.cuda.is_available():
             logger.info(f"CUDA version: {torch.version.cuda}")
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-
-        server.serve_forever()
+            
+        # Start the server loop with restart capability
+        try:
+            logger.info("Server started and ready to handle requests")
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Server stopped by keyboard interrupt")
+        except Exception as loop_ex:
+            logger.error(f"Error in server main loop: {loop_ex}", exc_info=True)
+            
+    except OSError as os_err:
+        if os_err.errno == 98:  # Address already in use
+            logger.error(f"Port {HTTP_PORT} is already in use. Is another instance running?")
+        else:
+            logger.error(f"OS error starting server: {os_err}", exc_info=True)
     except KeyboardInterrupt:
-        logger.info("Server stopped by keyboard interrupt")
+        logger.info("Server initialization interrupted by user")
     except Exception as ex:
         logger.error(f"Error starting server: {ex}", exc_info=True)
     finally:
         logger.info("Server shutting down")
+        
+        # Shutdown the server properly if it was created
+        if server:
+            try:
+                logger.info("Shutting down HTTP server...")
+                server.server_close()
+            except Exception as server_err:
+                logger.error(f"Error shutting down HTTP server: {server_err}")
+        
         # Cleanup all detectors
         with detector_lock:
             for detector_id, detector in list(detectors.items()):
                 try:
+                    logger.info(f"Shutting down detector {detector_id}...")
                     detector.shutdown()
-                except Exception:
-                    pass
+                except Exception as det_err:
+                    logger.error(f"Error shutting down detector {detector_id}: {det_err}")
             detectors.clear()
+            
+        logger.info("Server shutdown complete")
 
 
 def handle_signals() -> None:
