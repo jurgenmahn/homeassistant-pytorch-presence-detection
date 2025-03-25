@@ -12,7 +12,7 @@ services:
     volumes:
       - "../models:/app/models"  # Mount models directory for access to YOLO models
     environment:
-      - TCP_PORT=5505
+      - HTTP_PORT=5505
       - DEBUG=false
     deploy:
       resources:
