@@ -1022,12 +1022,12 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
             socket_logger.error(f"Disk space critically low, refusing client connection from {addr}")
             try:
                 error_msg = {"type": "error", "message": "Server disk space critical, please try again later"}
-                json_data = json.dumps(error_msg).encode("utf-8")
-                length = len(json_data)
-                sock.sendall(length.to_bytes(4, byteorder="big"))
-                sock.sendall(json_data)
+                
+                # Use the framed message protocol (start/end markers)
+                write_message_to_socket(sock, error_msg)
                 sock.close()
-            except:
+            except Exception as ex:
+                socket_logger.error(f"Error sending disk space error message: {ex}")
                 pass
             return
             
@@ -1047,6 +1047,19 @@ def handle_client_connection(sock: socket.socket, addr: Tuple[str, int]) -> None
             socket_logger.warning(f"Error processing message from client {addr}: {decode_ex}")
             return
         
+        # Special case: Handle watchdog ping messages even before auth
+        if message.get("type") == "watchdog_ping":
+            socket_logger.info(f"Received watchdog ping from {addr}, responding")
+            response = {
+                "type": "watchdog_pong",
+                "server_timestamp": time.time(),
+                "message": "Server is healthy"
+            }
+            if not write_message_to_socket(sock, response):
+                socket_logger.warning(f"Connection lost with client {addr} while sending watchdog pong")
+            return
+            
+        # Normal auth flow
         if message.get("type") != "auth":
             socket_logger.warning(f"Expected auth message, got {message.get('type')} from client {addr}")
             response = {"type": "error", "message": "Authentication required"}

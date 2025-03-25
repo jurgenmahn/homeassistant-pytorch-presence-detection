@@ -439,11 +439,16 @@ class SocketWatchdog:
         
         logger.info(f"Socket watchdog stopped for {self.host}:{self.port}")
     
+    # Message markers for framed protocol - must match server and client
+    _MESSAGE_START = b'<<<START>>>'
+    _MESSAGE_END = b'<<<END>>>'
+    
     def _check_socket(self) -> bool:
         """
         Check if the socket is open and accepting connections.
         
         Uses a "ping" type message that's designed specifically for watchdog health checks.
+        Uses the same marker-based protocol as the main communication.
         
         Returns:
             bool: True if socket is healthy, False otherwise
@@ -452,7 +457,7 @@ class SocketWatchdog:
         try:
             # Create socket
             sock = self.socket.socket(self.socket.AF_INET, self.socket.SOCK_STREAM)
-            sock.settimeout(5)  # 5 second timeout
+            sock.settimeout(10)  # 10 second timeout for the entire operation
             
             # Try to connect
             result = sock.connect_ex((self.host, self.port))
@@ -460,7 +465,7 @@ class SocketWatchdog:
                 logger.warning(f"Socket check failed: connect_ex returned {result}")
                 return False
             
-            # Additional check: Try to send/receive data
+            # Additional check: Try to send/receive data using marker-based protocol
             try:
                 # Send a special watchdog ping message
                 # This is specifically designed for health checks and won't
@@ -473,61 +478,87 @@ class SocketWatchdog:
                 
                 import json
                 message_bytes = json.dumps(test_message).encode('utf-8')
-                length_bytes = len(message_bytes).to_bytes(4, byteorder="big")
                 
-                # Send message length followed by message
-                sock.sendall(length_bytes + message_bytes)
+                # Create framed message with start/end markers (matching the server protocol)
+                framed_message = self._MESSAGE_START + message_bytes + self._MESSAGE_END
                 
-                # Try to receive response with short timeout
-                # First read the length with an even shorter timeout
+                # Send the framed message
+                logger.debug("Sending watchdog ping message")
+                sock.sendall(framed_message)
+                
+                # Read response using marker-based protocol
                 try:
-                    # Start with a short timeout just for the length
-                    sock.settimeout(2)
-                    response_length_bytes = sock.recv(4)
-                    if not response_length_bytes or len(response_length_bytes) != 4:
-                        logger.warning("Socket check failed: couldn't receive response length")
-                        return False
-                except self.socket.timeout:
-                    logger.warning("Socket check failed: timeout receiving response length")
-                    return False
+                    # Use a timeout for the entire read operation
+                    sock.settimeout(10)
+                    buffer = bytearray()
+                    message_started = False
                     
-                # Parse the length
-                response_length = int.from_bytes(response_length_bytes, byteorder="big")
-                if response_length <= 0 or response_length > 1024 * 1024:  # Max 1MB
-                    logger.warning(f"Socket check failed: invalid response length {response_length}")
-                    return False
+                    # We'll try to read for up to 10 seconds
+                    read_start_time = time.time()
+                    max_read_time = 10  # seconds
                     
-                # Set a slightly longer timeout for data
-                sock.settimeout(3)
+                    # Keep reading until we find the end marker or timeout
+                    while time.time() - read_start_time < max_read_time:
+                        # Read in chunks
+                        chunk = sock.recv(1024)
+                        if not chunk:  # Connection closed
+                            if message_started:
+                                logger.warning("Socket check failed: connection closed before receiving end marker")
+                            else:
+                                logger.warning("Socket check failed: connection closed before receiving any data")
+                            return False
+                        
+                        # Look for start marker if we haven't found it yet
+                        if not message_started:
+                            start_pos = chunk.find(self._MESSAGE_START)
+                            if start_pos >= 0:
+                                # Found start marker, keep data after it
+                                buffer.extend(chunk[start_pos + len(self._MESSAGE_START):])
+                                message_started = True
+                                logger.debug("Found message start marker in response")
+                            # Otherwise keep looking in next chunk
+                        else:
+                            # Already found start, append chunk and check for end
+                            buffer.extend(chunk)
+                        
+                        # Check for end marker if we've started a message
+                        if message_started:
+                            end_pos = buffer.find(self._MESSAGE_END)
+                            if end_pos >= 0:
+                                # Found end marker, extract message
+                                message_data = buffer[:end_pos]
+                                logger.debug(f"Found message end marker (message size: {len(message_data)} bytes)")
+                                
+                                # Try to parse the response
+                                try:
+                                    response = json.loads(message_data.decode("utf-8"))
+                                    # Look for watchdog_pong or any valid message type
+                                    if "type" in response:
+                                        logger.debug(f"Socket check succeeded: received {response.get('type')} response")
+                                        return True
+                                    else:
+                                        logger.warning(f"Socket check failed: received response with no type: {response}")
+                                        return False
+                                except Exception as parse_err:
+                                    logger.warning(f"Socket check failed: couldn't parse response: {parse_err}")
+                                    return False
+                        
+                        # Safety check for buffer size to prevent memory issues
+                        if len(buffer) > 1024 * 1024:  # 1MB max
+                            logger.error("Socket check failed: response too large")
+                            return False
                     
-                # Now read the response data
-                data = b""
-                remaining = response_length
-                while remaining > 0:
-                    chunk = sock.recv(min(remaining, 8192))
-                    if not chunk:  # Connection closed
-                        logger.warning("Socket check failed: connection closed while reading response")
-                        return False
-                    data += chunk
-                    remaining -= len(chunk)
-                    
-                # Try to parse the response
-                try:
-                    response = json.loads(data.decode("utf-8"))
-                    # Look for watchdog_pong or any valid message type
-                    if "type" in response:
-                        logger.debug(f"Socket check succeeded: received {response.get('type')} response")
-                        return True
+                    # If we get here, we timed out waiting for complete message
+                    if message_started:
+                        logger.warning("Socket check failed: timeout waiting for end marker")
                     else:
-                        logger.warning(f"Socket check failed: received response with no type: {response}")
-                        return False
-                except Exception as parse_err:
-                    logger.warning(f"Socket check failed: couldn't parse response: {parse_err}")
+                        logger.warning("Socket check failed: timeout waiting for start marker")
                     return False
                     
-                # Successfully sent and received data
-                return True
-                
+                except self.socket.timeout:
+                    logger.warning("Socket check failed: timeout receiving response")
+                    return False
+                    
             except Exception as ex:
                 logger.warning(f"Socket data exchange failed: {str(ex)}")
                 return False
