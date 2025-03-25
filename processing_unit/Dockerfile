@@ -23,7 +23,7 @@ RUN mkdir -p /app/models
 EXPOSE 5505
 
 # Copy and use the startup script
-COPY new_scripts/start.sh /app/start.sh
+COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 # Command to run the server

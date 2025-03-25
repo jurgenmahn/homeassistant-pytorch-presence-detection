@@ -1,2 +1,4 @@
 /.venv
 /rsync
+/*cache*
+*pycache*
