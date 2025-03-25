@@ -47,13 +47,20 @@ except ImportError:
 
 from ultralytics import YOLO
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("yolo_server.log")],
+# Import and configure logging
+from logging_config import configure_logging
+
+# Import our RTSP stream processor
+from rtsp_stream_processor import RTSPStreamProcessor
+
+# Set up logging with DEBUG level for console output
+logger = configure_logging(
+    logger_name="yolo_server",
+    log_level=logging.DEBUG,  # Set overall log level to DEBUG
+    console_level=logging.DEBUG,  # Set console level to DEBUG
+    file_level=logging.DEBUG,
+    detailed_format=True,
 )
-logger = logging.getLogger("yolo_server")
 
 # Constants
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 5505))
@@ -76,6 +83,12 @@ PROTECTED_PATHS = [
 # Store for detector instances (key: detector_id)
 detectors: Dict[str, Any] = {}  # Will store YoloDetector instances
 detector_lock = threading.Lock()
+
+# Store for processed images (key: detector_id)
+processed_images: Dict[str, Any] = (
+    {}
+)  # Will store latest processed image for each detector
+processed_images_lock = threading.Lock()
 
 
 class YoloDetector:
@@ -121,10 +134,11 @@ class YoloDetector:
 
         # Runtime state
         self.is_running = False
-        self.detection_thread = None
         self.stop_event = threading.Event()
-        self.cap = None
         self.frame_count = 0
+
+        # RTSP Stream Processor - replaces old cap and stream handling
+        self.stream_processor = None
 
         # Detection state
         self.last_detection_time = None
@@ -133,7 +147,6 @@ class YoloDetector:
         self.people_count = 0
         self.pet_count = 0
         self.connection_status = "disconnected"
-        self.last_frame = None  # Store last processed frame for debugging
 
         # Last update time for clients to check for changes
         self.last_update_time = time.time()
@@ -177,12 +190,7 @@ class YoloDetector:
                     f"Could not open stream for {self.detector_id}, will retry on next poll"
                 )
 
-            # Start stream monitor thread to keep the stream connected
-            self.stop_event.clear()
-            self.detection_thread = threading.Thread(target=self._stream_monitor_loop)
-            if self.detection_thread:  # Type checking validation
-                self.detection_thread.daemon = True
-                self.detection_thread.start()
+            # No need for stream monitor thread anymore - the RTSPStreamProcessor handles this
 
             self.is_running = True
             self.connection_status = "connected" if stream_opened else "connecting"
@@ -251,7 +259,7 @@ class YoloDetector:
         logger.info(f"Class mapping: {CLASS_MAP}")
 
     def _open_stream(self) -> bool:
-        """Open the video stream."""
+        """Open the video stream using RTSPStreamProcessor."""
         if not self.stream_url:
             logger.error(f"No stream URL provided for detector {self.detector_id}")
             return False
@@ -280,13 +288,13 @@ class YoloDetector:
             except Exception:
                 logger.info("Opening stream (URL parsing failed)")
 
-            # Close any existing stream
-            if self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+            # Stop and clean up any existing stream processor
+            if self.stream_processor is not None:
+                logger.info(
+                    f"Stopping existing stream processor for {self.detector_id}"
+                )
+                self.stream_processor.stop()
+                self.stream_processor = None
 
             # For RTSP streams, try to use TCP transport by appending to URL first
             url_to_use = self.stream_url
@@ -296,246 +304,29 @@ class YoloDetector:
                     url_to_use = f"{self.stream_url}?transport=tcp"
                     logger.info("Using TCP transport parameter in URL")
 
-            # Open the stream with OpenCV
-            self.cap = cv2.VideoCapture(url_to_use)
+            # Create a new stream processor with appropriate settings
+            self.stream_processor = RTSPStreamProcessor(
+                rtsp_url=url_to_use,
+                process_nth_frame=15 * 5,
+                reconnect_delay=self.stream_reconnect_delay,
+            )
 
-            # Configure stream parameters if opened successfully
-            if self.cap.isOpened():
-                # Configure for optimal streaming performance
-                self.cap.set(
-                    cv2.CAP_PROP_BUFFERSIZE, 3
-                )  # Small buffer to reduce latency
-
-                # For RTSP streams, set additional parameters
-                if self.stream_url.startswith("rtsp://"):
-                    # Try to set preferred codec
-                    try:
-                        self.cap.set(
-                            cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"H264")
-                        )
-                    except Exception as ex:
-                        logger.debug(f"Could not set codec: {ex}")
-
-                    # Try using TCP transport for better reliability
-                    # Different OpenCV versions use different constant names
-                    try:
-                        # Try commonly used property IDs for RTSP transport
-                        transport_props = [
-                            ("CAP_PROP_RTSP_TRANSPORT", 0),  # Newer OpenCV
-                            (78, 0),  # Direct property ID
-                            ("CV_CAP_PROP_RTSP_TRANSPORT", 0),  # Older OpenCV
-                        ]
-
-                        for prop, value in transport_props:
-                            try:
-                                if isinstance(prop, str):
-                                    if hasattr(cv2, prop):
-                                        self.cap.set(getattr(cv2, prop), value)
-                                        logger.info(
-                                            f"Set RTSP transport to TCP using {prop}"
-                                        )
-                                        break
-                                else:
-                                    self.cap.set(prop, value)
-                                    logger.info(
-                                        "Set RTSP transport to TCP using property ID"
-                                    )
-                                    break
-                            except Exception:
-                                continue
-
-                    except Exception as ex:
-                        logger.debug(f"Could not set RTSP transport: {ex}")
-
-                    # Set preferred frame rate
-                    try:
-                        self.cap.set(cv2.CAP_PROP_FPS, 15)
-                    except Exception as ex:
-                        logger.debug(f"Could not set FPS: {ex}")
-
-                # Verify the connection by attempting to read a frame
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    logger.info(f"Stream opened and verified for {self.detector_id}")
-                    return True
-                else:
-                    logger.warning(
-                        f"Stream opened but failed to read frame for {self.detector_id}"
-                    )
-                    self.cap.release()
-                    self.cap = None
-                    return False
-            else:
-                logger.error(f"Failed to open stream for {self.detector_id}")
+            # Start the stream processor
+            logger.info(f"Starting stream processor for {self.detector_id}")
+            if not self.stream_processor.start():
+                logger.error(f"Failed to start stream processor for {self.detector_id}")
                 return False
 
-        except Exception as ex:
-            logger.error(f"Error opening stream: {ex}", exc_info=True)
-            if self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+            # Successfully started the stream processor
+            logger.info(f"Stream processor started successfully for {self.detector_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error opening stream for {self.detector_id}: {e}")
             return False
 
-    def _stream_monitor_loop(self) -> None:
-        """
-        Stream monitor loop that keeps the connection alive but doesn't perform detection.
-        Detection will only happen on poll requests.
-        """
-        logger.info(f"Starting stream monitor for {self.detector_id}")
-
-        # How often to check the stream health
-        check_interval = 5  # seconds
-
-        # When to try reading a frame to verify stream health
-        frame_check_interval = 30  # seconds
-        last_frame_check = 0
-
-        while not self.stop_event.is_set():
-            try:
-                current_time = time.time()
-
-                # If we've been idle too long, shut down the detector
-                if current_time - self.last_client_request > self.max_idle_time:
-                    logger.info(
-                        f"Detector {self.detector_id} has been idle for too long, shutting down"
-                    )
-                    self.stop_event.set()
-                    break
-
-                # Make sure we have a valid capture device
-                if self.cap is None or not self.cap.isOpened():
-                    # Try to reconnect
-                    logger.warning(
-                        f"Stream not available for {self.detector_id}, attempting to reconnect"
-                    )
-                    self.connection_status = "reconnecting"
-                    self.stream_reconnect_attempts += 1
-
-                    if (
-                        self.stream_reconnect_attempts
-                        > self.max_stream_reconnect_attempts
-                    ):
-                        logger.error(
-                            f"Max reconnection attempts ({self.max_stream_reconnect_attempts}) reached for {self.detector_id}"
-                        )
-                        self.connection_status = "error"
-
-                        # Reset counter but use exponential backoff for next attempt series
-                        time.sleep(
-                            min(
-                                30
-                                * (
-                                    self.stream_reconnect_attempts
-                                    // self.max_stream_reconnect_attempts
-                                ),
-                                300,
-                            )
-                        )
-                        logger.info(
-                            "Resetting reconnection attempts counter and trying again"
-                        )
-                        self.stream_reconnect_attempts = 0
-                    else:
-                        # Calculate progressive backoff delay
-                        current_delay = self.stream_reconnect_delay * (
-                            2 ** (self.stream_reconnect_attempts - 1)
-                        )
-                        current_delay = min(current_delay, 30)  # Cap at 30 seconds
-
-                        logger.info(
-                            f"Reconnection attempt {self.stream_reconnect_attempts}/{self.max_stream_reconnect_attempts} "
-                            + f"with {current_delay:.1f}s delay"
-                        )
-
-                        # Close existing capture if any
-                        if self.cap is not None:
-                            try:
-                                self.cap.release()
-                                self.cap = None
-                            except Exception:
-                                pass
-
-                        # Wait before attempting reconnection
-                        time.sleep(current_delay)
-
-                        # Try to reopen the stream
-                        if self._open_stream():
-                            logger.info(
-                                f"Successfully reconnected to stream for {self.detector_id}"
-                            )
-                            self.connection_status = "connected"
-                            self.stream_reconnect_attempts = 0
-                        else:
-                            logger.warning(
-                                f"Reconnection attempt {self.stream_reconnect_attempts} failed"
-                            )
-
-                    continue
-
-                # Periodically check if the stream is still healthy by reading a frame
-                if current_time - last_frame_check > frame_check_interval:
-                    # Try to read a frame just to verify connection is still working
-                    ret, frame = self.cap.read()
-
-                    if not ret or frame is None:
-                        logger.warning(
-                            f"Failed to read frame from stream during health check for {self.detector_id}"
-                        )
-                        self.connection_status = "error"
-                        # Try to reconnect
-                        if self._open_stream():
-                            logger.info(
-                                "Successfully reconnected to stream after health check failure"
-                            )
-                            self.connection_status = "connected"
-                        else:
-                            # Skip this iteration and try again later
-                            time.sleep(check_interval)
-                            continue
-                    else:
-                        # Stream is healthy
-                        self.connection_status = "connected"
-                        # Store the most recent frame for potential use in detection
-                        self.last_frame = frame.copy()
-                        logger.debug(
-                            f"Stream health check passed for {self.detector_id}"
-                        )
-
-                    # Update the last health check time
-                    last_frame_check = current_time
-
-                # Sleep before next check
-                time.sleep(check_interval)
-
-            except cv2.error as cv_err:
-                logger.error(f"OpenCV error in stream monitor: {cv_err}")
-                self.error_counts["stream"] += 1
-                # Try to reconnect to the stream
-                self._open_stream()
-                time.sleep(self.error_recovery_delay)
-
-            except Exception as ex:
-                logger.error(f"Error in stream monitor: {ex}", exc_info=True)
-                self.error_counts["other"] += 1
-                time.sleep(self.error_recovery_delay)
-
-                # Check if we need to apply error recovery
-                if self.consecutive_errors >= self.max_consecutive_errors:
-                    logger.warning(
-                        f"Too many consecutive errors ({self.consecutive_errors}), applying recovery measures"
-                    )
-                    # Try to reconnect to the stream
-                    self._open_stream()
-                    # Reset error counter
-                    self.consecutive_errors = 0
-                    # Sleep for a longer time
-                    time.sleep(10)
-
-        # Clean up when thread exits
-        self._cleanup()
+    # The _stream_monitor_loop function has been removed
+    # This functionality is now handled by the RTSPStreamProcessor class
 
     def perform_detection(self) -> bool:
         """
@@ -545,35 +336,27 @@ class YoloDetector:
         Returns:
             bool: True if detection was successful, False otherwise
         """
-        if not self.is_running or self.cap is None or not self.cap.isOpened():
+        if (
+            not self.is_running
+            or self.stream_processor is None
+            or not self.stream_processor.is_running()
+        ):
             logger.warning(
                 f"Cannot perform detection: detector {self.detector_id} not ready"
             )
             return False
 
         try:
-            # Read frame from the video stream
-            ret, frame = self.cap.read()
+            # Get the latest frame from the stream processor
+            frame = self.stream_processor.get_latest_frame()
 
-            if not ret or frame is None:
+            if frame is None:
                 logger.warning(
-                    f"Failed to read frame for detection from {self.detector_id}"
+                    f"No frame available for detection from {self.detector_id}"
                 )
 
-                # Try to reconnect
-                if not self._open_stream():
-                    return False
-
-                # Try one more time to read a frame
-                ret, frame = self.cap.read()
-                if not ret or frame is None:
-                    logger.error(
-                        f"Failed to read frame after reconnection for {self.detector_id}"
-                    )
-                    return False
-
-            # Store the frame
-            self.last_frame = frame.copy()
+            # Log that we received a frame for processing
+            logger.debug(f"Got frame for detection processing: {frame.shape}")
 
             # Update connection status
             self.connection_status = "connected"
@@ -583,9 +366,6 @@ class YoloDetector:
 
             # Get frame dimensions for logging
             original_height, original_width = frame.shape[:2]
-
-            # YOLO expects dimensions in (width, height) format
-            # The imgsz parameter controls the internal resize that YOLO does
 
             # YOLO models have a stride requirement - dimensions should be multiples of stride
             # Default stride is 32 for most YOLO models
@@ -598,6 +378,9 @@ class YoloDetector:
             # Ensure we have at least one stride worth of pixels
             adjusted_width = max(adjusted_width, STRIDE)
             adjusted_height = max(adjusted_height, STRIDE)
+
+            # Set the adjusted dimensions early for safety
+            self.adjusted_dimensions = (adjusted_width, adjusted_height)
 
             if (
                 adjusted_width != self.input_width
@@ -612,14 +395,20 @@ class YoloDetector:
                     f"Using detection with configured size: {self.input_width}x{self.input_height} for detector {self.detector_id}"
                 )
 
+            # Explicitly resize the frame to the adjusted dimensions before detection
+            resized_frame = cv2.resize(
+                frame, (adjusted_width, adjusted_height), interpolation=cv2.INTER_LINEAR
+            )
+            logger.debug(
+                f"Resized frame to {adjusted_width}x{adjusted_height} for detection"
+            )
+
+            # Pass the pre-resized frame to YOLO model
             start_time = time.time()
             results = self.model(
-                frame,
+                resized_frame,
                 conf=self.confidence_threshold,
-                imgsz=(
-                    adjusted_width,
-                    adjusted_height,
-                ),  # Tell YOLO what size to use (stride-adjusted)
+                # No need to specify imgsz since we've already resized the frame
             )
             inference_time = (time.time() - start_time) * 1000  # in milliseconds
 
@@ -639,8 +428,13 @@ class YoloDetector:
                 # Get boxes and class information
                 boxes = result.boxes
 
-                # Create an annotated version of the frame for visualization
-                annotated_frame = frame.copy()
+                # Use the resized frame as base for annotation
+                annotated_frame = resized_frame.copy()
+
+                # Log dimensions for debugging
+                logger.debug(
+                    f"Creating annotated frame with dimensions: {annotated_frame.shape[1]}x{annotated_frame.shape[0]}"
+                )
 
                 for box in boxes:
                     cls_id = int(box.cls.item())
@@ -661,26 +455,34 @@ class YoloDetector:
                         if cls_id == 0:  # Person
                             people_detected = True
                             people_count += 1
+                            logger.debug(
+                                f"Person detected with confidence {confidence:.2f}"
+                            )
                         elif cls_id in [15, 16, 17]:  # Bird, cat, dog
                             pets_detected = True
                             pet_count += 1
+                            logger.debug(
+                                f"{class_name} detected with confidence {confidence:.2f}"
+                            )
 
-                        # Draw bounding box on the annotated frame
-                        # Get box coordinates (xyxy format)
+                        # Get box coordinates (xyxy format) - these are already for the resized frame
                         x1, y1, x2, y2 = box.xyxy[0].tolist()
 
-                        # Convert to original frame coordinates if needed
-                        orig_height, orig_width = annotated_frame.shape[:2]
-                        x1 = int(x1 * orig_width / self.adjusted_dimensions[0])
-                        y1 = int(y1 * orig_height / self.adjusted_dimensions[1])
-                        x2 = int(x2 * orig_width / self.adjusted_dimensions[0])
-                        y2 = int(y2 * orig_height / self.adjusted_dimensions[1])
+                        # Convert to integers
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-                        # Ensure coordinates are within frame bounds
-                        x1 = max(0, min(orig_width - 1, x1))
-                        y1 = max(0, min(orig_height - 1, y1))
-                        x2 = max(0, min(orig_width - 1, x2))
-                        y2 = max(0, min(orig_height - 1, y2))
+                        # Log the raw coordinates
+                        logger.debug(
+                            f"Detection coordinates: ({x1}, {y1}) to ({x2}, {y2})"
+                        )
+
+                        # Ensure coordinates are within the resized frame bounds
+                        # OpenCV shape is (height, width)
+                        annotated_height, annotated_width = annotated_frame.shape[:2]
+                        x1 = max(0, min(annotated_width - 1, x1))
+                        y1 = max(0, min(annotated_height - 1, y1))
+                        x2 = max(0, min(annotated_width - 1, x2))
+                        y2 = max(0, min(annotated_height - 1, y2))
 
                         # Draw rectangle
                         color = (
@@ -768,6 +570,17 @@ class YoloDetector:
             self.last_annotated_frame = annotated_frame
             self.last_annotated_time = time.time()
 
+            # Store the image in the global processed_images dict for the /jpeg endpoint
+            with processed_images_lock:
+                # Encode as JPEG
+                _, jpg_data = cv2.imencode(
+                    ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                )
+                processed_images[self.detector_id] = jpg_data.tobytes()
+                logger.debug(
+                    f"Updated processed image for detector {self.detector_id}: {len(jpg_data)} bytes, people: {people_count}, pets: {pet_count}"
+                )
+
             # Create detailed detection report
             detection_report = ", ".join(
                 [f"{count} {obj}" for obj, count in detected_objects.items()]
@@ -782,8 +595,8 @@ class YoloDetector:
                 f"objects: {detection_report}, "
                 f"time: {inference_time:.1f}ms, "
                 f"original size: {original_width}x{original_height}, "
-                f"requested size: {self.input_width}x{self.input_height}, "
-                f"adjusted size: {adjusted_width}x{adjusted_height}"
+                f"processed size: {adjusted_width}x{adjusted_height}, "
+                f"boxes correctly drawn on resized frame"
             )
 
             return True
@@ -812,13 +625,13 @@ class YoloDetector:
         """Clean up resources."""
         logger.info(f"Cleaning up detector {self.detector_id}")
 
-        # Release video capture
-        if self.cap is not None:
+        # Stop and clean up stream processor
+        if self.stream_processor is not None:
             try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
+                self.stream_processor.stop()
+            except Exception as e:
+                logger.error(f"Error stopping stream processor: {e}")
+            self.stream_processor = None
 
         # Set status flags
         self.is_running = False
@@ -1219,35 +1032,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
             logger.warning(f"Authentication error: {ex}")
             return False
 
-    def _send_auth_required(self) -> None:
-        """Send authentication required response."""
-        self.send_response(401)
-        self.send_header(
-            "WWW-Authenticate", 'Basic realm="YOLO Presence Detection Server"'
-        )
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-
-        # Create a simple HTML page
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Authentication Required</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 50px; text-align: center; }
-                h1 { color: #d32f2f; }
-                p { font-size: 18px; color: #333; }
-            </style>
-        </head>
-        <body>
-            <h1>Authentication Required</h1>
-            <p>Please login with valid credentials to access this page.</p>
-        </body>
-        </html>
-        """
-
-        self.wfile.write(html.encode())
+    # Removed _send_auth_required method as requested
 
     def _send_mjpeg_frame(self, frame, boundary="--boundarydonotcross"):
         """Send a single frame as part of an MJPEG stream."""
@@ -1484,10 +1269,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Handle GET requests."""
         try:
-            # Check authentication for protected paths
-            if not self._check_auth():
-                self._send_auth_required()
-                return
+            # Authentication removed as requested
 
             # Parse URL and query parameters
             parsed_url = urlparse(self.path)
@@ -1729,9 +1511,10 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                     self._send_error_response(
                         f"Error listing detectors: {str(ex)}", 500
                     )
-            elif path == "/stream" and detector_id:
-                # Stream the latest annotated frame as MJPEG
+            elif path == "/jpeg" and detector_id:
+                # Simple JPEG endpoint that serves the processed image stored in processed_images
                 try:
+                    # Check if detector exists
                     with detector_lock:
                         if detector_id not in detectors:
                             self._send_error_response(
@@ -1739,44 +1522,13 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             )
                             return
 
-                        detector = detectors[detector_id]
-
-                        # Check if we have an annotated frame
-                        if detector.last_annotated_frame is None:
-                            self._send_error_response(
-                                "No annotated frame available yet", 404
+                    # Get the pre-encoded JPEG data from processed_images
+                    with processed_images_lock:
+                        if detector_id not in processed_images:
+                            logger.debug(
+                                f"No processed image found for detector {detector_id}, creating placeholder"
                             )
-                            return
-
-                        # SAFETY BYPASS: Instead of streaming directly in the main server thread,
-                        # Use a static image with a JavaScript-based stream approach
-                        logger.info(
-                            f"Using static image approach for detector {detector_id}"
-                        )
-
-                        # Set headers for HTML page
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/html")
-                        self.send_header(
-                            "Content-Type",
-                            f"multipart/x-mixed-replace; boundary={boundary}",
-                        )
-                        # Set caching headers to prevent any caching
-                        self.send_header(
-                            "Cache-Control", "no-cache, no-store, must-revalidate"
-                        )
-                        self.send_header("Pragma", "no-cache")
-                        self.send_header("Expires", "0")
-                        # Add CORS headers to allow embedding in other pages
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-
-                        # Send the initial boundary to properly start the multipart message
-                        self.wfile.write(f"--{boundary}\r\n".encode())
-
-                        # Create a placeholder frame with a message if no annotated frame is available
-                        def create_placeholder_frame():
+                            # If no processed image exists yet, create a placeholder
                             placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
                             cv2.putText(
                                 placeholder,
@@ -1787,272 +1539,18 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 (255, 255, 255),
                                 2,
                             )
-                            return placeholder
-
-                        # Track if a detector exists outside the loop to reduce lock contention
-                        detector_exists = True
-                        max_failures = 3  # Maximum consecutive failures before we exit
-                        failure_count = 0
-
-                        # Stream frames indefinitely
-                        while detector_exists and failure_count < max_failures:
-                            try:
-                                # Use a very short-lived lock to just get a copy of the frame
-                                frame_to_send = None
-                                detector_name = "Unknown"
-
-                                # Critical section - only hold the lock for the minimum time needed to copy the frame
-                                with detector_lock:
-                                    if detector_id not in detectors:
-                                        logger.info(
-                                            f"Detector {detector_id} no longer exists, ending stream"
-                                        )
-                                        detector_exists = False
-                                        break
-
-                                    detector = detectors[detector_id]
-                                    detector_name = detector.name
-
-                                    # Get the latest frame or none if not available
-                                    if (
-                                        detector.last_annotated_frame is not None
-                                        and detector.last_annotated_time > 0
-                                    ):
-                                        frame_to_send = (
-                                            detector.last_annotated_frame.copy()
-                                        )
-
-                                # We now release the lock and process the frame outside the lock
-
-                                # If we didn't get a frame, create a placeholder
-                                if frame_to_send is None:
-                                    frame_to_send = create_placeholder_frame()
-                                    # Add detector name to placeholder
-                                    cv2.putText(
-                                        frame_to_send,
-                                        f"Detector: {detector_name}",
-                                        (50, 200),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.7,
-                                        (255, 255, 255),
-                                        2,
-                                    )
-                                else:
-                                    # Add "live" indicator (all processing done outside the lock)
-                                    current_time = time.strftime("%H:%M:%S")
-
-                                    # Calculate safe position for text
-                                    h, w = frame_to_send.shape[:2]
-                                    text_size = cv2.getTextSize(
-                                        f"Live: {current_time}",
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.6,
-                                        2,
-                                    )[0]
-
-                                    # Place text in top-right, but ensure it's within frame bounds
-                                    text_x = max(
-                                        10, min(w - text_size[0] - 10, w - 180)
-                                    )
-                                    text_y = 25
-
-                                    cv2.putText(
-                                        frame_to_send,
-                                        f"Live: {current_time}",
-                                        (text_x, text_y),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.6,
-                                        (0, 255, 255),
-                                        2,
-                                    )
-
-                                    # Add the detector name as well for context
-                                    cv2.putText(
-                                        frame_to_send,
-                                        f"Detector: {detector_name}",
-                                        (text_x, text_y + 25),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.6,
-                                        (0, 255, 255),
-                                        2,
-                                    )
-
-                                # Send the frame (outside the critical section)
-                                if not self._send_mjpeg_frame(frame_to_send, boundary):
-                                    # Client disconnected or error occurred
-                                    logger.info(
-                                        f"Client disconnected from stream for detector {detector_id}"
-                                    )
-                                    break
-
-                                # Reset failure count on success
-                                failure_count = 0
-
-                                # Sleep for a bit to control frame rate
-                                time.sleep(0.2)  # 5 FPS is fine for this
-
-                            except Exception as stream_err:
-                                # Log error but try to continue
-                                logger.error(
-                                    f"Error in stream loop for {detector_id}: {stream_err}"
-                                )
-                                failure_count += 1
-
-                                # Create an error frame to send to the client
-                                error_frame = np.zeros((240, 320, 3), dtype=np.uint8)
-                                cv2.putText(
-                                    error_frame,
-                                    f"Stream error: {type(stream_err).__name__}",
-                                    (10, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    (255, 255, 255),
-                                    1,
-                                )
-
-                                # Try to send the error frame
-                                try:
-                                    self._send_mjpeg_frame(error_frame, boundary)
-                                except Exception as e:
-                                    logger.error(f"Failed to send error frame: {e}")
-
-                                # Add a small delay before retrying
-                                time.sleep(1)
-
-                        logger.info(f"MJPEG stream for detector {detector_id} ended")
-
-                        # Final cleanup - make sure connection is cleaned up
-                        try:
-                            # Add a final boundary to properly end the multipart message
-                            self.wfile.write(f"\r\n--{boundary}--\r\n".encode())
-                            self.wfile.flush()
-                        except Exception as cleanup_err:
-                            logger.debug(f"Error sending final boundary: {cleanup_err}")
-
-                        return
-                except Exception as ex:
-                    logger.error(f"Error streaming frames: {ex}", exc_info=True)
-                    self._send_error_response(f"Error streaming frames: {str(ex)}", 500)
-            elif path == "/jpeg" and detector_id:
-                # Return a single JPEG frame - much safer than continuous MJPEG streaming
-                try:
-                    with detector_lock:
-                        if detector_id not in detectors:
-                            self._send_error_response(
-                                f"Detector {detector_id} not found", 404
+                            _, jpg_data = cv2.imencode(
+                                ".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 90]
                             )
-                            return
-
-                        detector = detectors[detector_id]
-
-                        # Get the frame
-                        if detector.last_annotated_frame is not None:
-                            frame = detector.last_annotated_frame.copy()
+                            jpg_bytes = jpg_data.tobytes()
                         else:
-                            # Create placeholder
-                            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                            cv2.putText(
-                                frame,
-                                "Waiting for detection...",
-                                (50, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1,
-                                (255, 255, 255),
-                                2,
+                            # Use the pre-encoded image stored in processed_images
+                            jpg_bytes = processed_images[detector_id]
+                            logger.debug(
+                                f"Serving processed image for detector {detector_id}: {len(jpg_bytes)} bytes"
                             )
 
-                    # Function to draw text with a white outline for visibility
-                    def draw_outlined_text(
-                        img, text, position, font_scale=1.0, line_thickness=3, margin=30
-                    ):
-                        # Coordinates for text
-                        x, y = position
-
-                        # Draw black text (main text)
-                        cv2.putText(
-                            img,
-                            text,
-                            (x, y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale,
-                            (0, 0, 0),  # Black
-                            line_thickness,
-                        )
-
-                        # Draw white outline
-                        cv2.putText(
-                            img,
-                            text,
-                            (x, y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale,
-                            (255, 255, 255),  # White
-                            int(line_thickness / 3),
-                        )
-
-                        return y + margin  # Return next y position
-
-                    # Add rich information to the frame
-                    current_time = time.strftime("%H:%M:%S")
-                    y_pos = 40
-
-                    # Time
-                    y_pos = draw_outlined_text(
-                        frame, f"Time: {current_time}", (10, y_pos), 1.2, 3
-                    )
-
-                    # Get detector info from the query string
-                    try:
-                        query = parse_qs(urlparse(self.path).query)
-                        detector_id = query.get("detector_id", ["Unknown"])[0]
-
-                        with detector_lock:
-                            if detector_id in detectors:
-                                detector = detectors[detector_id]
-
-                                # Detector name
-                                y_pos = draw_outlined_text(
-                                    frame,
-                                    f"Detector: {detector.name}",
-                                    (10, y_pos),
-                                    1.0,
-                                    3,
-                                )
-
-                                # Detection counts
-                                if (
-                                    hasattr(detector, "people_count")
-                                    and detector.people_count > 0
-                                ):
-                                    y_pos = draw_outlined_text(
-                                        frame,
-                                        f"People: {detector.people_count}",
-                                        (10, y_pos),
-                                        1.0,
-                                        3,
-                                    )
-
-                                if (
-                                    hasattr(detector, "pet_count")
-                                    and detector.pet_count > 0
-                                ):
-                                    y_pos = draw_outlined_text(
-                                        frame,
-                                        f"Pets: {detector.pet_count}",
-                                        (10, y_pos),
-                                        1.0,
-                                        3,
-                                    )
-                    except Exception as ex:
-                        logger.error(f"Error adding text to frame: {ex}")
-
-                    # Encode as JPEG
-                    _, jpg_data = cv2.imencode(
-                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
-                    )
-                    jpg_bytes = jpg_data.tobytes()
-
-                    # Send the JPEG
+                    # Send the JPEG - simple headers
                     self.send_response(200)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(jpg_bytes)))
@@ -2083,7 +1581,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
 
                         detector = detectors[detector_id]
 
-                        # Create a simple HTML page with the embedded MJPEG stream
+                        # Create a simple HTML page with JPEG that refreshes with timer
                         html = f"""
                         <!DOCTYPE html>
                         <html>
@@ -2093,16 +1591,6 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; text-align: center; background-color: #f0f0f0; }}
                                 h1 {{ color: #333; }}
                                 .container {{ max-width: 1200px; margin: 0 auto; }}
-                                .stream {{ 
-                                    width: 100%; 
-                                    max-width: 1024px; 
-                                    margin: 20px auto; 
-                                    border: 2px solid #333; 
-                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                                    height: auto !important; /* Important - maintain aspect ratio */
-                                    min-height: 240px; /* Ensure image is not too small */
-                                    object-fit: contain; /* Maintain aspect ratio */
-                                }}
                                 .info {{ 
                                     background-color: #fff; 
                                     padding: 15px; 
@@ -2118,7 +1606,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 .disconnected {{ background-color: #f8d7da; color: #721c24; }}
                                 .reconnecting {{ background-color: #fff3cd; color: #856404; }}
                                 .error {{ background-color: #f8d7da; color: #721c24; }}
-                                .refresh {{ 
+                                .refresh-btn {{ 
                                     padding: 10px 15px; 
                                     background-color: #007bff; 
                                     color: white; 
@@ -2127,7 +1615,24 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     cursor: pointer; 
                                     font-size: 16px;
                                 }}
-                                .refresh:hover {{ background-color: #0069d9; }}
+                                .refresh-btn:hover {{ background-color: #0069d9; }}
+                                #image-container {{
+                                    width: 100%;
+                                    max-width: 1024px;
+                                    margin: 20px auto;
+                                    border: 2px solid #333;
+                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                                    background-color: #000;
+                                    position: relative;
+                                    min-height: 480px;
+                                }}
+                                #detector-image {{
+                                    width: 100%;
+                                    height: auto;
+                                    min-height: 480px;
+                                    display: block;
+                                    object-fit: contain;
+                                }}
                             </style>
                         </head>
                         <body>
@@ -2141,48 +1646,87 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     <p>Status: <span class="status {detector.connection_status}">{detector.connection_status}</span></p>
                                     <p>Resolution: {detector.input_width}x{detector.input_height}</p>
                                     <p>Confidence threshold: {detector.confidence_threshold}</p>
-                                    <p>Auto-optimization: {"Enabled" if detector.auto_optimization else "Disabled"}</p>
                                 </div>
                                 
-                                <div style="width:100%; max-width:1024px; margin:20px auto; border:2px solid #333; box-shadow:0 4px 8px rgba(0,0,0,0.1); background-color:#000; position:relative; min-height:320px;">
-                                    <img id="stream-img" src="/jpeg?detector_id={detector_id}" alt="Live detection stream" style="width:100%; height:auto; min-height:320px; display:block;" />
-                                    <!-- Status elements are hidden but still used by JavaScript -->
-                                    <div id="connection-status" style="display:none;"></div>
-                                    <div id="fps-counter" style="display:none;"></div>
-                                    <div id="status-text" style="display:none;"></div>
+                                <div id="image-container">
+                                    <img id="detector-image" src="/jpeg?detector_id={detector_id}" alt="Live detection stream" />
                                 </div>
+                                
+                                <div id="status-info" style="margin:10px auto; padding:8px; background-color:#f0f0f0; border-radius:4px; max-width:1024px; text-align:center; font-weight:bold;">
+                                    Starting...
+                                </div>
+                                
+                                <div style="margin:10px auto; max-width:1024px;">
+                                    <button id="play-pause-btn" class="refresh-btn" style="margin-right:10px;">Pause</button>
+                                    <button class="refresh-btn" onclick="window.location.reload()">Refresh Page</button>
+                                </div>
+                                
                                 <script>
-                                    // Simple auto-refreshing image
+                                    // Simple timer-based image refresh
                                     document.addEventListener('DOMContentLoaded', function() {{
-                                        const streamImg = document.getElementById('stream-img');
-                                        const refreshRate = 200; // milliseconds (5 fps)
+                                        const img = document.getElementById('detector-image');
+                                        const statusDiv = document.getElementById('status-info');
+                                        const playPauseBtn = document.getElementById('play-pause-btn');
                                         let frameCount = 0;
+                                        let refreshInterval = 200; // milliseconds (5 FPS)
+                                        let refreshTimer = null;
+                                        let isPaused = false;
                                         
-                                        // Function to refresh the image
-                                        function refreshImage() {{
-                                            // Add timestamp to prevent caching
-                                            const url = `/jpeg?detector_id={detector_id}&t=${{Date.now()}}`;
-                                            
-                                            // Set the new source
-                                            streamImg.src = url;
+                                        // Function to update the image
+                                        function updateImage() {{
+                                            // Update the image with a timestamp to prevent caching
+                                            img.src = `/jpeg?detector_id={detector_id}&t=${{Date.now()}}`;
                                             frameCount++;
-                                            
-                                            // Schedule next refresh
-                                            setTimeout(refreshImage, refreshRate);
+                                            statusDiv.textContent = `Frame count: ${{frameCount}}`;
                                         }}
                                         
-                                        // Load first image immediately
-                                        refreshImage();
+                                        // Start the refresh timer
+                                        function startRefresh() {{
+                                            if (!refreshTimer) {{
+                                                refreshTimer = setInterval(updateImage, refreshInterval);
+                                                statusDiv.textContent = "Streaming...";
+                                            }}
+                                        }}
                                         
-                                        // Auto-refresh the whole page every 5 minutes to prevent memory issues
-                                        setTimeout(() => {{
-                                            window.location.reload();
-                                        }}, 5 * 60 * 1000);
-                                    }});
-                                
-                                <p>
-                                    <button class="refresh" onclick="window.location.reload()">Refresh Page</button>
-                                </p>
+                                        // Stop the refresh timer
+                                        function stopRefresh() {{
+                                            if (refreshTimer) {{
+                                                clearInterval(refreshTimer);
+                                                refreshTimer = null;
+                                                statusDiv.textContent = "Paused";
+                                            }}
+                                        }}
+                                        
+                                        // Toggle play/pause when button is clicked
+                                        playPauseBtn.addEventListener('click', function() {{
+                                            isPaused = !isPaused;
+                                            if (isPaused) {{
+                                                stopRefresh();
+                                                playPauseBtn.textContent = 'Resume';
+                                            }} else {{
+                                                startRefresh();
+                                                playPauseBtn.textContent = 'Pause';
+                                            }}
+                                        }});
+                                        
+                                        // Start refreshing immediately
+                                        startRefresh();
+                                        
+                                        // Detect when image loads successfully
+                                        img.onload = function() {{
+                                            // Success - do nothing
+                                        }};
+                                        
+                                        // Detect errors loading the image
+                                        img.onerror = function() {{
+                                            statusDiv.textContent = "Error loading image, retrying...";
+                                        }};
+                                    
+                                    // Auto-refresh the whole page every 5 minutes to prevent memory issues
+                                    setTimeout(function() {{
+                                        window.location.reload();
+                                    }}, 5 * 60 * 1000);
+                                </script>
                             </div>
                         </body>
                         </html>
@@ -2254,6 +1798,9 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 detection_start = time.time()
                                 logger.info(
                                     f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}"
+                                )
+                                logger.debug(
+                                    f"DEBUG: Processing poll request for {detector_id} - about to call perform_detection()"
                                 )
 
                                 try:
