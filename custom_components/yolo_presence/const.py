@@ -52,7 +52,7 @@ MODEL_OPTIONS = {
 }
 
 # Input size options
-INPUT_SIZE_OPTIONS = ["320x240", "640x480", "1280x720"]
+INPUT_SIZE_OPTIONS = ["320x240", "640x480", "1280x720", "1920x1080"]
 
 # Supported classes
 # 0=person, 15=bird, 16=cat, 17=dog

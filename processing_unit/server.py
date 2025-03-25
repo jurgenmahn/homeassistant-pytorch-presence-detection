@@ -86,6 +86,15 @@ class YoloDetector:
         self.detection_interval = config.get("detection_interval", 10)
         self.confidence_threshold = config.get("confidence_threshold", 0.25)
         self.frame_skip_rate = config.get("frame_skip_rate", 5)
+        
+        # Auto-optimization flag
+        self.auto_optimization = config.get("use_auto_optimization", config.get("auto_config", False))
+        
+        # Detection results data
+        self.inference_time = 0
+        self.detected_objects = {}
+        self.frame_dimensions = (0, 0)
+        self.adjusted_dimensions = (0, 0)
 
         # Runtime state
         self.is_running = False
@@ -512,17 +521,50 @@ class YoloDetector:
             # Increment frame counter
             self.frame_count += 1
             
-            # Resize frame for model input
-            frame_resized = cv2.resize(frame, (self.input_width, self.input_height))
+            # Get frame dimensions for logging
+            original_height, original_width = frame.shape[:2]
             
-            # Perform detection
-            results = self.model(frame_resized, conf=self.confidence_threshold)
+            # YOLO expects dimensions in (width, height) format
+            # The imgsz parameter controls the internal resize that YOLO does
+            
+            # YOLO models have a stride requirement - dimensions should be multiples of stride
+            # Default stride is 32 for most YOLO models
+            STRIDE = 32
+            
+            # Adjust width and height to be multiples of STRIDE
+            adjusted_width = (self.input_width // STRIDE) * STRIDE
+            adjusted_height = (self.input_height // STRIDE) * STRIDE
+            
+            # Ensure we have at least one stride worth of pixels
+            adjusted_width = max(adjusted_width, STRIDE)
+            adjusted_height = max(adjusted_height, STRIDE)
+            
+            if adjusted_width != self.input_width or adjusted_height != self.input_height:
+                logger.info(
+                    f"Adjusting input size from {self.input_width}x{self.input_height} to "
+                    f"{adjusted_width}x{adjusted_height} (multiple of stride {STRIDE}) for detector {self.detector_id}"
+                )
+            else:
+                logger.debug(
+                    f"Using detection with configured size: {self.input_width}x{self.input_height} for detector {self.detector_id}"
+                )
+            
+            start_time = time.time()
+            results = self.model(
+                frame, 
+                conf=self.confidence_threshold,
+                imgsz=(adjusted_width, adjusted_height)  # Tell YOLO what size to use (stride-adjusted)
+            )
+            inference_time = (time.time() - start_time) * 1000  # in milliseconds
             
             # Process results
             people_detected = False
             pets_detected = False
             people_count = 0
             pet_count = 0
+            
+            # Store detected objects for detailed reporting
+            detected_objects = {}
             
             if len(results) > 0:
                 # Extract detections - YOLO v8 format
@@ -537,6 +579,13 @@ class YoloDetector:
                     
                     # Only process supported classes with sufficient confidence
                     if cls_id in SUPPORTED_CLASSES and confidence >= self.confidence_threshold:
+                        class_name = CLASS_MAP.get(cls_id, f"class_{cls_id}")
+                        
+                        # Count in detected objects
+                        if class_name not in detected_objects:
+                            detected_objects[class_name] = 0
+                        detected_objects[class_name] += 1
+                        
                         if cls_id == 0:  # Person
                             people_detected = True
                             people_count += 1
@@ -551,11 +600,28 @@ class YoloDetector:
             self.pet_count = pet_count
             self.last_detection_time = time.time()
             self.last_update_time = time.time()
+            self.inference_time = inference_time
+            self.detected_objects = detected_objects
+            # Store original frame dimensions (width x height for consistency)
+            self.frame_dimensions = (original_width, original_height)
             
-            # Log detection
+            # Store the adjusted dimensions that were actually used
+            self.adjusted_dimensions = (adjusted_width, adjusted_height)
+            
+            # Create detailed detection report
+            detection_report = ", ".join([f"{count} {obj}" for obj, count in detected_objects.items()])
+            if not detection_report:
+                detection_report = "nothing detected"
+            
+            # Log detection with detailed information
             logger.info(
                 f"Detection for {self.detector_id}: people={people_detected}({people_count}), "
-                f"pets={pets_detected}({pet_count})"
+                f"pets={pets_detected}({pet_count}), "
+                f"objects: {detection_report}, "
+                f"time: {inference_time:.1f}ms, "
+                f"original size: {original_width}x{original_height}, "
+                f"requested size: {self.input_width}x{self.input_height}, "
+                f"adjusted size: {adjusted_width}x{adjusted_height}"
             )
             
             return True
@@ -637,6 +703,12 @@ class YoloDetector:
             "frame_count": self.frame_count,
             "optimization_level": self.optimization_level,
             "degradation_level": self.degradation_level,
+            "auto_optimization": self.auto_optimization,
+            "requested_resolution": f"{self.input_width}x{self.input_height}",  # User requested resolution
+            "actual_resolution": f"{self.adjusted_dimensions[0]}x{self.adjusted_dimensions[1]}" if hasattr(self, "adjusted_dimensions") else f"{self.input_width}x{self.input_height}",  # Adjusted for stride
+            "inference_time_ms": round(self.inference_time, 1) if hasattr(self, "inference_time") else 0,
+            "detected_objects": self.detected_objects if hasattr(self, "detected_objects") else {},
+            "original_frame_dimensions": self.frame_dimensions if hasattr(self, "frame_dimensions") else (0, 0),
         }
 
 
@@ -645,8 +717,8 @@ def create_or_update_detector(
 ) -> Dict[str, Any]:
     """Create or update a detector with the given configuration."""
     with detector_lock:
-        # Check for auto-configuration mode
-        auto_config = config.get("auto_config", False)
+        # Check for auto-configuration mode (both auto_config and use_auto_optimization for compatibility)
+        auto_config = config.get("auto_config", config.get("use_auto_optimization", False))
         
         if detector_id in detectors:
             # Update existing detector
@@ -654,6 +726,9 @@ def create_or_update_detector(
             logger.info(f"Updating existing detector {detector_id}")
             
             settings_changed = False
+            
+            # Save auto_optimization flag in detector
+            detector.auto_optimization = auto_config
             
             # Track which settings are being updated
             updated_settings = []
@@ -711,8 +786,8 @@ def create_or_update_detector(
                 except Exception as ex:
                     logger.warning(f"Invalid frame_skip_rate: {config.get('frame_skip_rate')} - {ex}")
                     
-            # Auto configure if requested
-            if auto_config:
+            # Auto configure if requested and enabled
+            if auto_config and detector.auto_optimization:
                 # Determine if we need performance optimization or quality improvement based on resources
                 try:
                     # Check CPU/GPU usage
@@ -761,6 +836,11 @@ def create_or_update_detector(
                         
                 except Exception as ex:
                     logger.warning(f"Auto-configuration error: {ex}")
+            elif auto_config and not detector.auto_optimization:
+                # Auto-config requested but detector doesn't have it enabled yet
+                detector.auto_optimization = True
+                updated_settings.append("auto_optimization (enabled)")
+                logger.info(f"Enabled auto-optimization for detector {detector_id}")
 
             # Update last client request time to prevent idle shutdown
             detector.last_client_request = time.time()
@@ -814,6 +894,10 @@ def create_or_update_detector(
                 
             if not config.get("frame_skip_rate"):
                 config["frame_skip_rate"] = 5
+                
+            # Set auto_optimization flag if provided, otherwise default to False
+            if "use_auto_optimization" not in config and "auto_config" not in config:
+                config["use_auto_optimization"] = False
                 
             # Log the configuration being used
             logger.info(f"Creating detector {detector_id} with configuration: {json.dumps({k: v for k, v in config.items() if k != 'stream_url'})}")
@@ -1071,12 +1155,22 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                 
                 # Perform detection on current frame
                 detection_start = time.time()
-                logger.info(f"Performing detection for {detector_id} on poll request")
+                logger.info(f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}")
                 detection_success = detector.perform_detection()
                 detection_time = time.time() - detection_start
                 
                 if detection_success:
-                    logger.info(f"Detection completed in {detection_time:.3f}s")
+                    # Get the detailed detection information
+                    detection_info = ""
+                    if hasattr(detector, "detected_objects") and detector.detected_objects:
+                        items = [f"{count} {obj}" for obj, count in detector.detected_objects.items()]
+                        detection_info = f" - Found: {', '.join(items)}"
+                    
+                    # Log with additional info
+                    logger.info(
+                        f"Detection completed in {detection_time:.3f}s for {detector_id}{detection_info}"
+                    )
+                    
                     # Get updated state after detection
                     result["state"] = detector.get_state()
                     result["detection_time"] = detection_time
