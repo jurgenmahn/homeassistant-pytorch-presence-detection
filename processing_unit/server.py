@@ -234,8 +234,16 @@ class YoloDetector:
                     pass
                 self.cap = None
             
+            # For RTSP streams, try to use TCP transport by appending to URL first
+            url_to_use = self.stream_url
+            if self.stream_url.startswith("rtsp://"):
+                # If URL doesn't already have transport parameter, add it
+                if "?transport=" not in self.stream_url.lower():
+                    url_to_use = f"{self.stream_url}?transport=tcp"
+                    logger.info("Using TCP transport parameter in URL")
+            
             # Open the stream with OpenCV
-            self.cap = cv2.VideoCapture(self.stream_url)
+            self.cap = cv2.VideoCapture(url_to_use)
             
             # Configure stream parameters if opened successfully
             if self.cap.isOpened():
@@ -245,13 +253,43 @@ class YoloDetector:
                 # For RTSP streams, set additional parameters
                 if self.stream_url.startswith("rtsp://"):
                     # Try to set preferred codec
-                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
+                    try:
+                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
+                    except Exception as ex:
+                        logger.debug(f"Could not set codec: {ex}")
                     
-                    # Use TCP transport for better reliability
-                    self.cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 0)  # 0=TCP (more reliable), 1=UDP
+                    # Try using TCP transport for better reliability
+                    # Different OpenCV versions use different constant names
+                    try:
+                        # Try commonly used property IDs for RTSP transport
+                        transport_props = [
+                            ("CAP_PROP_RTSP_TRANSPORT", 0),  # Newer OpenCV
+                            (78, 0),  # Direct property ID
+                            ("CV_CAP_PROP_RTSP_TRANSPORT", 0)  # Older OpenCV
+                        ]
+                        
+                        for prop, value in transport_props:
+                            try:
+                                if isinstance(prop, str):
+                                    if hasattr(cv2, prop):
+                                        self.cap.set(getattr(cv2, prop), value)
+                                        logger.info(f"Set RTSP transport to TCP using {prop}")
+                                        break
+                                else:
+                                    self.cap.set(prop, value)
+                                    logger.info("Set RTSP transport to TCP using property ID")
+                                    break
+                            except Exception:
+                                continue
+                        
+                    except Exception as ex:
+                        logger.debug(f"Could not set RTSP transport: {ex}")
                     
                     # Set preferred frame rate
-                    self.cap.set(cv2.CAP_PROP_FPS, 15)
+                    try:
+                        self.cap.set(cv2.CAP_PROP_FPS, 15)
+                    except Exception as ex:
+                        logger.debug(f"Could not set FPS: {ex}")
                 
                 # Verify the connection by attempting to read a frame
                 ret, frame = self.cap.read()
