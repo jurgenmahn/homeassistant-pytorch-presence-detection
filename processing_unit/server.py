@@ -1779,26 +1779,56 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             )
                             return placeholder
 
+                        # Track if a detector exists outside the loop to reduce lock contention
+                        detector_exists = True
+                        max_failures = 3  # Maximum consecutive failures before we exit
+                        failure_count = 0
+
                         # Stream frames indefinitely
-                        while True:
-                            # Use detector lock to safely access the frame
-                            with detector_lock:
-                                if detector_id not in detectors:
-                                    logger.info(
-                                        f"Detector {detector_id} no longer exists, ending stream"
+                        while detector_exists and failure_count < max_failures:
+                            try:
+                                # Use a very short-lived lock to just get a copy of the frame
+                                frame_to_send = None
+                                detector_name = "Unknown"
+
+                                # Critical section - only hold the lock for the minimum time needed to copy the frame
+                                with detector_lock:
+                                    if detector_id not in detectors:
+                                        logger.info(
+                                            f"Detector {detector_id} no longer exists, ending stream"
+                                        )
+                                        detector_exists = False
+                                        break
+
+                                    detector = detectors[detector_id]
+                                    detector_name = detector.name
+
+                                    # Get the latest frame or none if not available
+                                    if (
+                                        detector.last_annotated_frame is not None
+                                        and detector.last_annotated_time > 0
+                                    ):
+                                        frame_to_send = (
+                                            detector.last_annotated_frame.copy()
+                                        )
+
+                                # We now release the lock and process the frame outside the lock
+
+                                # If we didn't get a frame, create a placeholder
+                                if frame_to_send is None:
+                                    frame_to_send = create_placeholder_frame()
+                                    # Add detector name to placeholder
+                                    cv2.putText(
+                                        frame_to_send,
+                                        f"Detector: {detector_name}",
+                                        (50, 200),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.7,
+                                        (255, 255, 255),
+                                        2,
                                     )
-                                    break
-
-                                detector = detectors[detector_id]
-
-                                # Get the latest frame or a placeholder if none available
-                                if (
-                                    detector.last_annotated_frame is not None
-                                    and detector.last_annotated_time > 0
-                                ):
-                                    frame_to_send = detector.last_annotated_frame.copy()
-
-                                    # Add "live" indicator
+                                else:
+                                    # Add "live" indicator (all processing done outside the lock)
                                     current_time = time.strftime("%H:%M:%S")
 
                                     # Calculate safe position for text
@@ -1825,18 +1855,70 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                         (0, 255, 255),
                                         2,
                                     )
-                                else:
-                                    frame_to_send = create_placeholder_frame()
 
-                            # Send the frame
-                            if not self._send_mjpeg_frame(frame_to_send, boundary):
-                                # Client disconnected or error occurred
-                                break
+                                    # Add the detector name as well for context
+                                    cv2.putText(
+                                        frame_to_send,
+                                        f"Detector: {detector_name}",
+                                        (text_x, text_y + 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        (0, 255, 255),
+                                        2,
+                                    )
 
-                            # Sleep for a bit to control frame rate (5 FPS is fine for this)
-                            time.sleep(0.2)
+                                # Send the frame (outside the critical section)
+                                if not self._send_mjpeg_frame(frame_to_send, boundary):
+                                    # Client disconnected or error occurred
+                                    logger.info(
+                                        f"Client disconnected from stream for detector {detector_id}"
+                                    )
+                                    break
+
+                                # Reset failure count on success
+                                failure_count = 0
+
+                                # Sleep for a bit to control frame rate
+                                time.sleep(0.2)  # 5 FPS is fine for this
+
+                            except Exception as stream_err:
+                                # Log error but try to continue
+                                logger.error(
+                                    f"Error in stream loop for {detector_id}: {stream_err}"
+                                )
+                                failure_count += 1
+
+                                # Create an error frame to send to the client
+                                error_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                                cv2.putText(
+                                    error_frame,
+                                    f"Stream error: {type(stream_err).__name__}",
+                                    (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5,
+                                    (255, 255, 255),
+                                    1,
+                                )
+
+                                # Try to send the error frame
+                                try:
+                                    self._send_mjpeg_frame(error_frame, boundary)
+                                except Exception as e:
+                                    logger.error(f"Failed to send error frame: {e}")
+
+                                # Add a small delay before retrying
+                                time.sleep(1)
 
                         logger.info(f"MJPEG stream for detector {detector_id} ended")
+
+                        # Final cleanup - make sure connection is cleaned up
+                        try:
+                            # Add a final boundary to properly end the multipart message
+                            self.wfile.write(f"\r\n--{boundary}--\r\n".encode())
+                            self.wfile.flush()
+                        except Exception as cleanup_err:
+                            logger.debug(f"Error sending final boundary: {cleanup_err}")
+
                         return
                 except Exception as ex:
                     logger.error(f"Error streaming frames: {ex}", exc_info=True)
@@ -2140,8 +2222,21 @@ def start_http_server() -> None:
     """Start the HTTP server."""
     server = None
     try:
+        # Import ThreadingMixIn for concurrent request handling
+        from socketserver import ThreadingMixIn
+        import socket
+
+        # Create a threaded HTTP server for better concurrency
+        class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+            """Threaded HTTP server for handling multiple concurrent connections."""
+
+            # Set daemon_threads to True to ensure threads terminate when main thread exits
+            daemon_threads = True
+            # Allow socket reuse to prevent "Address already in use" errors
+            allow_reuse_address = True
+
         # Customize the HTTP server for better error handling
-        class RobustHTTPServer(HTTPServer):
+        class RobustHTTPServer(ThreadedHTTPServer):
             """Enhanced HTTP server with improved error handling."""
 
             def handle_error(self, request, client_address):
@@ -2156,6 +2251,13 @@ def start_http_server() -> None:
 
                 # Don't close the socket on errors
                 return
+
+            def server_bind(self):
+                """Override server_bind to set socket timeout."""
+                # Set socket options for quicker recovery from closed connections
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Call the parent method
+                super().server_bind()
 
         # Create the server with robust error handling
         server = RobustHTTPServer(("0.0.0.0", HTTP_PORT), YoloHTTPHandler)
