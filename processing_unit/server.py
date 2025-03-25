@@ -14,12 +14,15 @@ import sys
 import threading
 import time
 import urllib.parse
+import base64
+import numpy as np
 from typing import Dict, Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 import cv2
 import torch
+
 try:
     import psutil
 except ImportError:
@@ -28,7 +31,7 @@ except ImportError:
         @staticmethod
         def cpu_percent(*args, **kwargs):
             return 50.0  # Return a default value
-        
+
         @staticmethod
         def disk_usage(path):
             class DummyDiskUsage:
@@ -36,8 +39,9 @@ except ImportError:
                 used = 50
                 free = 50
                 percent = 50.0
+
             return DummyDiskUsage()
-    
+
     psutil = DummyPsutil()
     logging.warning("psutil not available, using dummy implementation")
 
@@ -55,6 +59,14 @@ logger = logging.getLogger("yolo_server")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 5505))
 SUPPORTED_CLASSES = [0, 15, 16, 17]  # person, bird, cat, dog
 CLASS_MAP = {0: "person", 15: "bird", 16: "cat", 17: "dog"}
+
+# Basic authentication settings
+# Get auth credentials from environment variables or use defaults
+AUTH_ENABLED = os.environ.get("ENABLE_AUTH", "false").lower() in ("true", "1", "yes")
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "yolopassword")
+# Create auth protection pattern
+PROTECTED_PATHS = ["/", "/view", "/stream"]  # Paths that require authentication
 
 # Store for detector instances (key: detector_id)
 detectors: Dict[str, Any] = {}  # Will store YoloDetector instances
@@ -86,14 +98,20 @@ class YoloDetector:
         self.detection_interval = config.get("detection_interval", 10)
         self.confidence_threshold = config.get("confidence_threshold", 0.25)
         self.frame_skip_rate = config.get("frame_skip_rate", 5)
-        
+
         # Auto-optimization flag
-        self.auto_optimization = config.get("use_auto_optimization", config.get("auto_config", False))
-        
+        self.auto_optimization = config.get(
+            "use_auto_optimization", config.get("auto_config", False)
+        )
+
         # Detection results data
         self.inference_time = 0
         self.detected_objects = {}
         self.frame_dimensions = (0, 0)
+
+        # Frame storage for visualization
+        self.last_annotated_frame = None  # Last frame with detection boxes drawn
+        self.last_annotated_time = 0  # Timestamp when the annotated frame was created
         self.adjusted_dimensions = (0, 0)
 
         # Runtime state
@@ -153,7 +171,7 @@ class YoloDetector:
                 logger.warning(
                     f"Could not open stream for {self.detector_id}, will retry on next poll"
                 )
-                
+
             # Start stream monitor thread to keep the stream connected
             self.stop_event.clear()
             self.detection_thread = threading.Thread(target=self._stream_monitor_loop)
@@ -238,23 +256,25 @@ class YoloDetector:
             try:
                 parsed_url = urllib.parse.urlparse(self.stream_url)
                 netloc = parsed_url.netloc
-                
+
                 # Log masked URL (hide password)
-                if '@' in netloc:
-                    userpass, hostport = netloc.split('@', 1)
-                    if ':' in userpass:
-                        user, _ = userpass.split(':', 1)
+                if "@" in netloc:
+                    userpass, hostport = netloc.split("@", 1)
+                    if ":" in userpass:
+                        user, _ = userpass.split(":", 1)
                         masked_netloc = f"{user}:****@{hostport}"
                     else:
                         masked_netloc = f"{userpass}@{hostport}"
-                    
-                    masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+
+                    masked_url = (
+                        f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                    )
                     logger.info(f"Opening stream: {masked_url}")
                 else:
                     logger.info(f"Opening stream: {self.stream_url}")
             except Exception:
-                logger.info(f"Opening stream (URL parsing failed)")
-            
+                logger.info("Opening stream (URL parsing failed)")
+
             # Close any existing stream
             if self.cap is not None:
                 try:
@@ -262,7 +282,7 @@ class YoloDetector:
                 except Exception:
                     pass
                 self.cap = None
-            
+
             # For RTSP streams, try to use TCP transport by appending to URL first
             url_to_use = self.stream_url
             if self.stream_url.startswith("rtsp://"):
@@ -270,23 +290,27 @@ class YoloDetector:
                 if "?transport=" not in self.stream_url.lower():
                     url_to_use = f"{self.stream_url}?transport=tcp"
                     logger.info("Using TCP transport parameter in URL")
-            
+
             # Open the stream with OpenCV
             self.cap = cv2.VideoCapture(url_to_use)
-            
+
             # Configure stream parameters if opened successfully
             if self.cap.isOpened():
                 # Configure for optimal streaming performance
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Small buffer to reduce latency
-                
+                self.cap.set(
+                    cv2.CAP_PROP_BUFFERSIZE, 3
+                )  # Small buffer to reduce latency
+
                 # For RTSP streams, set additional parameters
                 if self.stream_url.startswith("rtsp://"):
                     # Try to set preferred codec
                     try:
-                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
+                        self.cap.set(
+                            cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"H264")
+                        )
                     except Exception as ex:
                         logger.debug(f"Could not set codec: {ex}")
-                    
+
                     # Try using TCP transport for better reliability
                     # Different OpenCV versions use different constant names
                     try:
@@ -294,46 +318,52 @@ class YoloDetector:
                         transport_props = [
                             ("CAP_PROP_RTSP_TRANSPORT", 0),  # Newer OpenCV
                             (78, 0),  # Direct property ID
-                            ("CV_CAP_PROP_RTSP_TRANSPORT", 0)  # Older OpenCV
+                            ("CV_CAP_PROP_RTSP_TRANSPORT", 0),  # Older OpenCV
                         ]
-                        
+
                         for prop, value in transport_props:
                             try:
                                 if isinstance(prop, str):
                                     if hasattr(cv2, prop):
                                         self.cap.set(getattr(cv2, prop), value)
-                                        logger.info(f"Set RTSP transport to TCP using {prop}")
+                                        logger.info(
+                                            f"Set RTSP transport to TCP using {prop}"
+                                        )
                                         break
                                 else:
                                     self.cap.set(prop, value)
-                                    logger.info("Set RTSP transport to TCP using property ID")
+                                    logger.info(
+                                        "Set RTSP transport to TCP using property ID"
+                                    )
                                     break
                             except Exception:
                                 continue
-                        
+
                     except Exception as ex:
                         logger.debug(f"Could not set RTSP transport: {ex}")
-                    
+
                     # Set preferred frame rate
                     try:
                         self.cap.set(cv2.CAP_PROP_FPS, 15)
                     except Exception as ex:
                         logger.debug(f"Could not set FPS: {ex}")
-                
+
                 # Verify the connection by attempting to read a frame
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
                     logger.info(f"Stream opened and verified for {self.detector_id}")
                     return True
                 else:
-                    logger.warning(f"Stream opened but failed to read frame for {self.detector_id}")
+                    logger.warning(
+                        f"Stream opened but failed to read frame for {self.detector_id}"
+                    )
                     self.cap.release()
                     self.cap = None
                     return False
             else:
                 logger.error(f"Failed to open stream for {self.detector_id}")
                 return False
-                
+
         except Exception as ex:
             logger.error(f"Error opening stream: {ex}", exc_info=True)
             if self.cap is not None:
@@ -353,7 +383,7 @@ class YoloDetector:
 
         # How often to check the stream health
         check_interval = 5  # seconds
-        
+
         # When to try reading a frame to verify stream health
         frame_check_interval = 30  # seconds
         last_frame_check = 0
@@ -387,19 +417,34 @@ class YoloDetector:
                             f"Max reconnection attempts ({self.max_stream_reconnect_attempts}) reached for {self.detector_id}"
                         )
                         self.connection_status = "error"
-                        
+
                         # Reset counter but use exponential backoff for next attempt series
-                        time.sleep(min(30 * (self.stream_reconnect_attempts // self.max_stream_reconnect_attempts), 300))
-                        logger.info(f"Resetting reconnection attempts counter and trying again")
+                        time.sleep(
+                            min(
+                                30
+                                * (
+                                    self.stream_reconnect_attempts
+                                    // self.max_stream_reconnect_attempts
+                                ),
+                                300,
+                            )
+                        )
+                        logger.info(
+                            "Resetting reconnection attempts counter and trying again"
+                        )
                         self.stream_reconnect_attempts = 0
                     else:
                         # Calculate progressive backoff delay
-                        current_delay = self.stream_reconnect_delay * (2 ** (self.stream_reconnect_attempts - 1))
+                        current_delay = self.stream_reconnect_delay * (
+                            2 ** (self.stream_reconnect_attempts - 1)
+                        )
                         current_delay = min(current_delay, 30)  # Cap at 30 seconds
-                        
-                        logger.info(f"Reconnection attempt {self.stream_reconnect_attempts}/{self.max_stream_reconnect_attempts} " +
-                                    f"with {current_delay:.1f}s delay")
-                        
+
+                        logger.info(
+                            f"Reconnection attempt {self.stream_reconnect_attempts}/{self.max_stream_reconnect_attempts} "
+                            + f"with {current_delay:.1f}s delay"
+                        )
+
                         # Close existing capture if any
                         if self.cap is not None:
                             try:
@@ -407,10 +452,10 @@ class YoloDetector:
                                 self.cap = None
                             except Exception:
                                 pass
-                        
+
                         # Wait before attempting reconnection
                         time.sleep(current_delay)
-                        
+
                         # Try to reopen the stream
                         if self._open_stream():
                             logger.info(
@@ -419,7 +464,9 @@ class YoloDetector:
                             self.connection_status = "connected"
                             self.stream_reconnect_attempts = 0
                         else:
-                            logger.warning(f"Reconnection attempt {self.stream_reconnect_attempts} failed")
+                            logger.warning(
+                                f"Reconnection attempt {self.stream_reconnect_attempts} failed"
+                            )
 
                     continue
 
@@ -427,7 +474,7 @@ class YoloDetector:
                 if current_time - last_frame_check > frame_check_interval:
                     # Try to read a frame just to verify connection is still working
                     ret, frame = self.cap.read()
-                    
+
                     if not ret or frame is None:
                         logger.warning(
                             f"Failed to read frame from stream during health check for {self.detector_id}"
@@ -448,8 +495,10 @@ class YoloDetector:
                         self.connection_status = "connected"
                         # Store the most recent frame for potential use in detection
                         self.last_frame = frame.copy()
-                        logger.debug(f"Stream health check passed for {self.detector_id}")
-                        
+                        logger.debug(
+                            f"Stream health check passed for {self.detector_id}"
+                        )
+
                     # Update the last health check time
                     last_frame_check = current_time
 
@@ -467,7 +516,7 @@ class YoloDetector:
                 logger.error(f"Error in stream monitor: {ex}", exc_info=True)
                 self.error_counts["other"] += 1
                 time.sleep(self.error_recovery_delay)
-                
+
                 # Check if we need to apply error recovery
                 if self.consecutive_errors >= self.max_consecutive_errors:
                     logger.warning(
@@ -482,64 +531,73 @@ class YoloDetector:
 
         # Clean up when thread exits
         self._cleanup()
-        
+
     def perform_detection(self) -> bool:
         """
         Perform detection on the current frame.
         This is called on each poll request rather than continuously.
-        
+
         Returns:
             bool: True if detection was successful, False otherwise
         """
         if not self.is_running or self.cap is None or not self.cap.isOpened():
-            logger.warning(f"Cannot perform detection: detector {self.detector_id} not ready")
+            logger.warning(
+                f"Cannot perform detection: detector {self.detector_id} not ready"
+            )
             return False
-            
+
         try:
             # Read frame from the video stream
             ret, frame = self.cap.read()
-            
+
             if not ret or frame is None:
-                logger.warning(f"Failed to read frame for detection from {self.detector_id}")
-                
+                logger.warning(
+                    f"Failed to read frame for detection from {self.detector_id}"
+                )
+
                 # Try to reconnect
                 if not self._open_stream():
                     return False
-                    
+
                 # Try one more time to read a frame
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
-                    logger.error(f"Failed to read frame after reconnection for {self.detector_id}")
+                    logger.error(
+                        f"Failed to read frame after reconnection for {self.detector_id}"
+                    )
                     return False
-                    
+
             # Store the frame
             self.last_frame = frame.copy()
-            
+
             # Update connection status
             self.connection_status = "connected"
-            
+
             # Increment frame counter
             self.frame_count += 1
-            
+
             # Get frame dimensions for logging
             original_height, original_width = frame.shape[:2]
-            
+
             # YOLO expects dimensions in (width, height) format
             # The imgsz parameter controls the internal resize that YOLO does
-            
+
             # YOLO models have a stride requirement - dimensions should be multiples of stride
             # Default stride is 32 for most YOLO models
             STRIDE = 32
-            
+
             # Adjust width and height to be multiples of STRIDE
             adjusted_width = (self.input_width // STRIDE) * STRIDE
             adjusted_height = (self.input_height // STRIDE) * STRIDE
-            
+
             # Ensure we have at least one stride worth of pixels
             adjusted_width = max(adjusted_width, STRIDE)
             adjusted_height = max(adjusted_height, STRIDE)
-            
-            if adjusted_width != self.input_width or adjusted_height != self.input_height:
+
+            if (
+                adjusted_width != self.input_width
+                or adjusted_height != self.input_height
+            ):
                 logger.info(
                     f"Adjusting input size from {self.input_width}x{self.input_height} to "
                     f"{adjusted_width}x{adjusted_height} (multiple of stride {STRIDE}) for detector {self.detector_id}"
@@ -548,51 +606,109 @@ class YoloDetector:
                 logger.debug(
                     f"Using detection with configured size: {self.input_width}x{self.input_height} for detector {self.detector_id}"
                 )
-            
+
             start_time = time.time()
             results = self.model(
-                frame, 
+                frame,
                 conf=self.confidence_threshold,
-                imgsz=(adjusted_width, adjusted_height)  # Tell YOLO what size to use (stride-adjusted)
+                imgsz=(
+                    adjusted_width,
+                    adjusted_height,
+                ),  # Tell YOLO what size to use (stride-adjusted)
             )
             inference_time = (time.time() - start_time) * 1000  # in milliseconds
-            
+
             # Process results
             people_detected = False
             pets_detected = False
             people_count = 0
             pet_count = 0
-            
+
             # Store detected objects for detailed reporting
             detected_objects = {}
-            
+
             if len(results) > 0:
                 # Extract detections - YOLO v8 format
                 result = results[0]  # First batch result
-                
+
                 # Get boxes and class information
                 boxes = result.boxes
-                
+
+                # Create an annotated version of the frame for visualization
+                annotated_frame = frame.copy()
+
                 for box in boxes:
                     cls_id = int(box.cls.item())
                     confidence = box.conf.item()
-                    
+
                     # Only process supported classes with sufficient confidence
-                    if cls_id in SUPPORTED_CLASSES and confidence >= self.confidence_threshold:
+                    if (
+                        cls_id in SUPPORTED_CLASSES
+                        and confidence >= self.confidence_threshold
+                    ):
                         class_name = CLASS_MAP.get(cls_id, f"class_{cls_id}")
-                        
+
                         # Count in detected objects
                         if class_name not in detected_objects:
                             detected_objects[class_name] = 0
                         detected_objects[class_name] += 1
-                        
+
                         if cls_id == 0:  # Person
                             people_detected = True
                             people_count += 1
                         elif cls_id in [15, 16, 17]:  # Bird, cat, dog
                             pets_detected = True
                             pet_count += 1
-            
+
+                        # Draw bounding box on the annotated frame
+                        # Get box coordinates (xyxy format)
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+                        # Convert to original frame coordinates if needed
+                        orig_height, orig_width = annotated_frame.shape[:2]
+                        x1 = int(x1 * orig_width / self.adjusted_dimensions[0])
+                        y1 = int(y1 * orig_height / self.adjusted_dimensions[1])
+                        x2 = int(x2 * orig_width / self.adjusted_dimensions[0])
+                        y2 = int(y2 * orig_height / self.adjusted_dimensions[1])
+
+                        # Ensure coordinates are within frame bounds
+                        x1 = max(0, min(orig_width - 1, x1))
+                        y1 = max(0, min(orig_height - 1, y1))
+                        x2 = max(0, min(orig_width - 1, x2))
+                        y2 = max(0, min(orig_height - 1, y2))
+
+                        # Draw rectangle
+                        color = (
+                            (0, 255, 0) if cls_id == 0 else (0, 165, 255)
+                        )  # Green for people, orange for pets
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+
+                        # Prepare label with class name and confidence
+                        label = f"{class_name} {confidence:.2f}"
+                        text_size, _ = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+                        )
+
+                        # Draw label background
+                        cv2.rectangle(
+                            annotated_frame,
+                            (x1, y1 - text_size[1] - 5),
+                            (x1 + text_size[0], y1),
+                            color,
+                            -1,
+                        )
+
+                        # Draw label text
+                        cv2.putText(
+                            annotated_frame,
+                            label,
+                            (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 0, 0),
+                            2,
+                        )
+
             # Update detection state
             self.people_detected = people_detected
             self.pets_detected = pets_detected
@@ -604,15 +720,56 @@ class YoloDetector:
             self.detected_objects = detected_objects
             # Store original frame dimensions (width x height for consistency)
             self.frame_dimensions = (original_width, original_height)
-            
+
             # Store the adjusted dimensions that were actually used
             self.adjusted_dimensions = (adjusted_width, adjusted_height)
-            
+
+            # Add timestamp and extra info to the annotated frame
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(
+                annotated_frame,
+                f"Time: {current_time}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+            # Add detection stats
+            info_text = f"People: {people_count}, Pets: {pet_count}"
+            cv2.putText(
+                annotated_frame,
+                info_text,
+                (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+            # Add inference time
+            cv2.putText(
+                annotated_frame,
+                f"Inference: {inference_time:.1f}ms",
+                (10, 85),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+            # Store the annotated frame for visualization endpoint
+            self.last_annotated_frame = annotated_frame
+            self.last_annotated_time = time.time()
+
             # Create detailed detection report
-            detection_report = ", ".join([f"{count} {obj}" for obj, count in detected_objects.items()])
+            detection_report = ", ".join(
+                [f"{count} {obj}" for obj, count in detected_objects.items()]
+            )
             if not detection_report:
                 detection_report = "nothing detected"
-            
+
             # Log detection with detailed information
             logger.info(
                 f"Detection for {self.detector_id}: people={people_detected}({people_count}), "
@@ -623,24 +780,24 @@ class YoloDetector:
                 f"requested size: {self.input_width}x{self.input_height}, "
                 f"adjusted size: {adjusted_width}x{adjusted_height}"
             )
-            
+
             return True
-            
+
         except torch.cuda.OutOfMemoryError as cuda_err:
             logger.error(f"CUDA out of memory error during detection: {cuda_err}")
             self.error_counts["cuda"] += 1
             return False
-            
+
         except MemoryError as mem_err:
             logger.error(f"Memory error during detection: {mem_err}")
             self.error_counts["memory"] += 1
             return False
-            
+
         except cv2.error as cv_err:
             logger.error(f"OpenCV error during detection: {cv_err}")
             self.error_counts["stream"] += 1
             return False
-            
+
         except Exception as ex:
             logger.error(f"Error during detection: {ex}", exc_info=True)
             self.error_counts["other"] += 1
@@ -705,10 +862,20 @@ class YoloDetector:
             "degradation_level": self.degradation_level,
             "auto_optimization": self.auto_optimization,
             "requested_resolution": f"{self.input_width}x{self.input_height}",  # User requested resolution
-            "actual_resolution": f"{self.adjusted_dimensions[0]}x{self.adjusted_dimensions[1]}" if hasattr(self, "adjusted_dimensions") else f"{self.input_width}x{self.input_height}",  # Adjusted for stride
-            "inference_time_ms": round(self.inference_time, 1) if hasattr(self, "inference_time") else 0,
-            "detected_objects": self.detected_objects if hasattr(self, "detected_objects") else {},
-            "original_frame_dimensions": self.frame_dimensions if hasattr(self, "frame_dimensions") else (0, 0),
+            "actual_resolution": (
+                f"{self.adjusted_dimensions[0]}x{self.adjusted_dimensions[1]}"
+                if hasattr(self, "adjusted_dimensions")
+                else f"{self.input_width}x{self.input_height}"
+            ),  # Adjusted for stride
+            "inference_time_ms": (
+                round(self.inference_time, 1) if hasattr(self, "inference_time") else 0
+            ),
+            "detected_objects": (
+                self.detected_objects if hasattr(self, "detected_objects") else {}
+            ),
+            "original_frame_dimensions": (
+                self.frame_dimensions if hasattr(self, "frame_dimensions") else (0, 0)
+            ),
         }
 
 
@@ -718,18 +885,20 @@ def create_or_update_detector(
     """Create or update a detector with the given configuration."""
     with detector_lock:
         # Check for auto-configuration mode (both auto_config and use_auto_optimization for compatibility)
-        auto_config = config.get("auto_config", config.get("use_auto_optimization", False))
-        
+        auto_config = config.get(
+            "auto_config", config.get("use_auto_optimization", False)
+        )
+
         if detector_id in detectors:
             # Update existing detector
             detector = detectors[detector_id]
             logger.info(f"Updating existing detector {detector_id}")
-            
+
             settings_changed = False
-            
+
             # Save auto_optimization flag in detector
             detector.auto_optimization = auto_config
-            
+
             # Track which settings are being updated
             updated_settings = []
 
@@ -739,16 +908,16 @@ def create_or_update_detector(
                 updated_settings.append("stream_url")
                 # Stream URL change requires reconnection
                 settings_changed = True
-                
+
             if config.get("name") and config["name"] != detector.name:
                 detector.name = config["name"]
                 updated_settings.append("name")
-                
+
             if config.get("model") and config["model"] != detector.model_name:
                 # Model changes require reinitialization, which we'll log but not actually reinitialize
                 detector.model_name = config["model"]
                 updated_settings.append("model (requires restart)")
-                
+
             if config.get("input_size"):
                 try:
                     width, height = map(int, config["input_size"].split("x"))
@@ -757,8 +926,10 @@ def create_or_update_detector(
                         detector.input_height = height
                         updated_settings.append("input_size")
                 except Exception as ex:
-                    logger.warning(f"Invalid input_size format: {config.get('input_size')} - {ex}")
-                    
+                    logger.warning(
+                        f"Invalid input_size format: {config.get('input_size')} - {ex}"
+                    )
+
             if config.get("detection_interval") is not None:
                 try:
                     interval = float(config["detection_interval"])
@@ -766,8 +937,10 @@ def create_or_update_detector(
                         detector.detection_interval = interval
                         updated_settings.append("detection_interval")
                 except Exception as ex:
-                    logger.warning(f"Invalid detection_interval: {config.get('detection_interval')} - {ex}")
-                    
+                    logger.warning(
+                        f"Invalid detection_interval: {config.get('detection_interval')} - {ex}"
+                    )
+
             if config.get("confidence_threshold") is not None:
                 try:
                     threshold = float(config["confidence_threshold"])
@@ -775,8 +948,10 @@ def create_or_update_detector(
                         detector.confidence_threshold = threshold
                         updated_settings.append("confidence_threshold")
                 except Exception as ex:
-                    logger.warning(f"Invalid confidence_threshold: {config.get('confidence_threshold')} - {ex}")
-                    
+                    logger.warning(
+                        f"Invalid confidence_threshold: {config.get('confidence_threshold')} - {ex}"
+                    )
+
             if config.get("frame_skip_rate") is not None:
                 try:
                     skip_rate = int(config["frame_skip_rate"])
@@ -784,56 +959,73 @@ def create_or_update_detector(
                         detector.frame_skip_rate = skip_rate
                         updated_settings.append("frame_skip_rate")
                 except Exception as ex:
-                    logger.warning(f"Invalid frame_skip_rate: {config.get('frame_skip_rate')} - {ex}")
-                    
+                    logger.warning(
+                        f"Invalid frame_skip_rate: {config.get('frame_skip_rate')} - {ex}"
+                    )
+
             # Auto configure if requested and enabled
             if auto_config and detector.auto_optimization:
                 # Determine if we need performance optimization or quality improvement based on resources
                 try:
                     # Check CPU/GPU usage
                     cpu_usage = psutil.cpu_percent()
-                    
-                    if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
-                        gpu_usage = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory * 100
+
+                    if (
+                        hasattr(torch.cuda, "is_available")
+                        and torch.cuda.is_available()
+                    ):
+                        gpu_usage = (
+                            torch.cuda.memory_allocated()
+                            / torch.cuda.get_device_properties(0).total_memory
+                            * 100
+                        )
                     else:
                         gpu_usage = 0
-                        
+
                     # Get current connection status
                     connection_ok = detector.connection_status == "connected"
-                    
+
                     if not connection_ok:
                         # Connection issues - reduce quality for better streaming
                         if detector.frame_skip_rate < 10:
                             detector.frame_skip_rate += 1
                             updated_settings.append("frame_skip_rate (auto increased)")
-                            
+
                         if detector.detection_interval < 20:
                             detector.detection_interval += 2
-                            updated_settings.append("detection_interval (auto increased)")
-                            
+                            updated_settings.append(
+                                "detection_interval (auto increased)"
+                            )
+
                     elif cpu_usage > 80 or gpu_usage > 80:
                         # High resource usage - reduce quality
                         if detector.frame_skip_rate < 8:
                             detector.frame_skip_rate += 1
                             updated_settings.append("frame_skip_rate (auto increased)")
-                            
+
                         if detector.detection_interval < 15:
                             detector.detection_interval += 1
-                            updated_settings.append("detection_interval (auto increased)")
+                            updated_settings.append(
+                                "detection_interval (auto increased)"
+                            )
                     elif cpu_usage < 40 and gpu_usage < 40:
                         # Low resource usage - increase quality
                         if detector.frame_skip_rate > 2:
                             detector.frame_skip_rate -= 1
                             updated_settings.append("frame_skip_rate (auto decreased)")
-                            
+
                         if detector.detection_interval > 3:
                             detector.detection_interval -= 1
-                            updated_settings.append("detection_interval (auto decreased)")
-                            
-                    # Log auto configuration changes 
+                            updated_settings.append(
+                                "detection_interval (auto decreased)"
+                            )
+
+                    # Log auto configuration changes
                     if updated_settings:
-                        logger.info(f"Auto-configured detector {detector_id}: {', '.join(updated_settings)}")
-                        
+                        logger.info(
+                            f"Auto-configured detector {detector_id}: {', '.join(updated_settings)}"
+                        )
+
                 except Exception as ex:
                     logger.warning(f"Auto-configuration error: {ex}")
             elif auto_config and not detector.auto_optimization:
@@ -844,29 +1036,38 @@ def create_or_update_detector(
 
             # Update last client request time to prevent idle shutdown
             detector.last_client_request = time.time()
-            
+
             # Log the updated settings
             if updated_settings:
-                logger.info(f"Updated detector {detector_id} settings: {', '.join(updated_settings)}")
-                
+                logger.info(
+                    f"Updated detector {detector_id} settings: {', '.join(updated_settings)}"
+                )
+
                 # If stream URL changed, try to reconnect immediately
                 if "stream_url" in updated_settings and detector.is_running:
-                    logger.info(f"Stream URL changed, attempting to reconnect for {detector_id}")
+                    logger.info(
+                        f"Stream URL changed, attempting to reconnect for {detector_id}"
+                    )
                     if detector._open_stream():
-                        logger.info(f"Successfully reconnected to new stream for {detector_id}")
+                        logger.info(
+                            f"Successfully reconnected to new stream for {detector_id}"
+                        )
                     else:
-                        logger.warning(f"Failed to connect to new stream for {detector_id}, will retry in detection loop")
+                        logger.warning(
+                            f"Failed to connect to new stream for {detector_id}, will retry in detection loop"
+                        )
 
             return {
                 "status": "success",
-                "message": f"Detector updated" + (f" ({', '.join(updated_settings)})" if updated_settings else ""),
+                "message": f"Detector updated"
+                + (f" ({', '.join(updated_settings)})" if updated_settings else ""),
                 "detector_id": detector_id,
                 "state": detector.get_state(),
             }
         else:
             # Create new detector
             logger.info(f"Creating new detector {detector_id}")
-            
+
             # Apply default configuration if not provided
             if not config.get("stream_url"):
                 logger.error(f"No stream URL provided for detector {detector_id}")
@@ -875,32 +1076,34 @@ def create_or_update_detector(
                     "message": "stream_url is required",
                     "detector_id": detector_id,
                 }
-                
+
             # Set default configuration if not provided
             if not config.get("name"):
                 config["name"] = f"Detector {detector_id[:8]}"
-                
+
             if not config.get("model"):
                 config["model"] = "yolo11l"
-                
+
             if not config.get("input_size"):
                 config["input_size"] = "640x480"
-                
+
             if not config.get("detection_interval"):
                 config["detection_interval"] = 10
-                
+
             if not config.get("confidence_threshold"):
                 config["confidence_threshold"] = 0.25
-                
+
             if not config.get("frame_skip_rate"):
                 config["frame_skip_rate"] = 5
-                
+
             # Set auto_optimization flag if provided, otherwise default to False
             if "use_auto_optimization" not in config and "auto_config" not in config:
                 config["use_auto_optimization"] = False
-                
+
             # Log the configuration being used
-            logger.info(f"Creating detector {detector_id} with configuration: {json.dumps({k: v for k, v in config.items() if k != 'stream_url'})}")
+            logger.info(
+                f"Creating detector {detector_id} with configuration: {json.dumps({k: v for k, v in config.items() if k != 'stream_url'})}"
+            )
             if "stream_url" in config:
                 masked_url = "[URL MASKED]"
                 try:
@@ -913,11 +1116,13 @@ def create_or_update_detector(
                             if ":" in userpass:
                                 user, _ = userpass.split(":", 1)
                                 masked_netloc = f"{user}:****@{hostport}"
-                                masked_url = f"{parsed.scheme}://{masked_netloc}{parsed.path}"
+                                masked_url = (
+                                    f"{parsed.scheme}://{masked_netloc}{parsed.path}"
+                                )
                 except:
                     pass
                 logger.info(f"Stream URL: {masked_url}")
-                
+
             detector = YoloDetector(detector_id, config)
 
             if detector.initialize():
@@ -952,7 +1157,7 @@ def check_disk_space() -> float:
 
 class YoloHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for YOLO detectors."""
-    
+
     # Add a more robust error handler
     def handle_one_request(self) -> None:
         """Handle a single HTTP request with improved error handling."""
@@ -961,20 +1166,120 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError) as e:
             logger.warning(f"Connection error with client {self.client_address}: {e}")
         except Exception as e:
-            logger.error(f"Error handling request from {self.client_address}: {e}", exc_info=True)
-    
+            logger.error(
+                f"Error handling request from {self.client_address}: {e}", exc_info=True
+            )
+
+    def _check_auth(self) -> bool:
+        """Check if the request has valid authentication.
+
+        Returns:
+            bool: True if authentication is valid or disabled, False otherwise.
+        """
+        # If auth is disabled, always return True
+        if not AUTH_ENABLED:
+            return True
+
+        # Check if path requires authentication
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+
+        # If path is not protected, no auth needed
+        if path not in PROTECTED_PATHS:
+            return True
+
+        # Check for auth header
+        auth_header = self.headers.get("Authorization")
+        if not auth_header:
+            # No auth header, authentication failed
+            return False
+
+        # Parse and validate auth header
+        try:
+            # Header format: "Basic base64encoded(username:password)"
+            auth_type, auth_info = auth_header.split(" ", 1)
+
+            if auth_type.lower() != "basic":
+                # We only support Basic auth
+                return False
+
+            # Decode the base64 auth info
+            auth_info_bytes = base64.b64decode(auth_info)
+            auth_info_text = auth_info_bytes.decode("utf-8")
+            username, password = auth_info_text.split(":", 1)
+
+            # Check credentials
+            return username == AUTH_USERNAME and password == AUTH_PASSWORD
+        except Exception as ex:
+            logger.warning(f"Authentication error: {ex}")
+            return False
+
+    def _send_auth_required(self) -> None:
+        """Send authentication required response."""
+        self.send_response(401)
+        self.send_header(
+            "WWW-Authenticate", 'Basic realm="YOLO Presence Detection Server"'
+        )
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+
+        # Create a simple HTML page
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Authentication Required</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 50px; text-align: center; }
+                h1 { color: #d32f2f; }
+                p { font-size: 18px; color: #333; }
+            </style>
+        </head>
+        <body>
+            <h1>Authentication Required</h1>
+            <p>Please login with valid credentials to access this page.</p>
+        </body>
+        </html>
+        """
+
+        self.wfile.write(html.encode())
+
+    def _send_mjpeg_frame(self, frame, boundary="--boundarydonotcross"):
+        """Send a single frame as part of an MJPEG stream."""
+        try:
+            # Encode the frame as JPEG
+            _, jpeg_data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            jpeg_bytes = jpeg_data.tobytes()
+
+            # Write the MJPEG part header
+            self.wfile.write(f"\r\n{boundary}\r\n".encode())
+            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+            self.wfile.write(f"Content-Length: {len(jpeg_bytes)}\r\n\r\n".encode())
+
+            # Write the JPEG data
+            self.wfile.write(jpeg_bytes)
+            self.wfile.flush()
+
+            return True
+        except (ConnectionResetError, BrokenPipeError) as e:
+            logger.warning(f"Client disconnected during MJPEG streaming: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending MJPEG frame: {e}")
+            return False
+
     def _send_response(self, data: Dict[str, Any], status_code: int = 200) -> None:
         """Send a JSON response."""
         try:
             # Prepare the response
             response_json = json.dumps(data)
             response_bytes = response_json.encode("utf-8")
-            
+
             # Log the response
             client_addr = self.client_address[0]
             request_method = self.command
             request_path = self.path
-            
+
             # Format the response for logging with some formatting
             log_data = data
             if isinstance(data, dict) and "state" in data:
@@ -986,10 +1291,10 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                         # Parse and mask password
                         parsed_url = urllib.parse.urlparse(stream_url)
                         netloc = parsed_url.netloc
-                        if '@' in netloc:
-                            userpass, hostport = netloc.split('@', 1)
-                            if ':' in userpass:
-                                user, _ = userpass.split(':', 1)
+                        if "@" in netloc:
+                            userpass, hostport = netloc.split("@", 1)
+                            if ":" in userpass:
+                                user, _ = userpass.split(":", 1)
                                 masked_netloc = f"{user}:****@{hostport}"
                                 masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
                                 # Create masked version for logging
@@ -997,7 +1302,7 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 masked_state["stream_url"] = masked_url
                                 log_data = data.copy()
                                 log_data["state"] = masked_state
-            
+
             # Log summary version or full version based on debug level
             response_log = json.dumps(log_data, indent=2)
             if len(response_log) > 1000:
@@ -1011,18 +1316,26 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                     if "state" in data and isinstance(data["state"], dict):
                         state = data["state"]
                         state_summary = {}
-                        for key in ["connection_status", "human_detected", "pet_detected", 
-                                    "human_count", "pet_count", "is_running"]:
+                        for key in [
+                            "connection_status",
+                            "human_detected",
+                            "pet_detected",
+                            "human_count",
+                            "pet_count",
+                            "is_running",
+                        ]:
                             if key in state:
                                 state_summary[key] = state[key]
                         summary["state"] = state_summary
                     response_log = json.dumps(summary, indent=2)
                 else:
                     response_log = f"{response_log[:997]}..."
-                
-            logger.info(f"RESPONSE to {client_addr} - {request_method} {request_path} - Status: {status_code}")
+
+            logger.info(
+                f"RESPONSE to {client_addr} - {request_method} {request_path} - Status: {status_code}"
+            )
             logger.info(f"RESPONSE BODY: {response_log}")
-            
+
             # Send the actual response
             try:
                 self.send_response(status_code)
@@ -1031,14 +1344,18 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_bytes)
             except (BrokenPipeError, ConnectionResetError) as e:
-                logger.warning(f"Connection closed by client during response to {client_addr}: {e}")
+                logger.warning(
+                    f"Connection closed by client during response to {client_addr}: {e}"
+                )
             except Exception as e:
                 logger.error(f"Error sending response to {client_addr}: {e}")
         except Exception as e:
             logger.error(f"Error preparing response: {e}", exc_info=True)
             # Try to send a simple error response
             try:
-                error_response = json.dumps({"status": "error", "message": "Internal server error"}).encode("utf-8")
+                error_response = json.dumps(
+                    {"status": "error", "message": "Internal server error"}
+                ).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-type", "application/json")
                 self.send_header("Content-Length", str(len(error_response)))
@@ -1059,27 +1376,31 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length == 0:
                 return {}
-    
+
             try:
                 # Read the raw body data
                 try:
                     body_raw = self.rfile.read(content_length).decode("utf-8")
                 except (ConnectionResetError, BrokenPipeError) as e:
-                    logger.warning(f"Connection closed by client while reading request body: {e}")
+                    logger.warning(
+                        f"Connection closed by client while reading request body: {e}"
+                    )
                     return {}
-                
+
                 # Log the raw request body
                 client_addr = self.client_address[0]
                 request_method = self.command
                 request_path = self.path
-                logger.info(f"REQUEST from {client_addr} - {request_method} {request_path}")
-                
+                logger.info(
+                    f"REQUEST from {client_addr} - {request_method} {request_path}"
+                )
+
                 # Mask any password in stream URLs for security
                 body_log = body_raw
                 try:
                     # Parse the JSON
                     body_json = json.loads(body_raw)
-                    
+
                     # If this contains a config with stream_url that has a password, mask it
                     if isinstance(body_json, dict) and "config" in body_json:
                         config = body_json.get("config", {})
@@ -1089,10 +1410,10 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 # Parse and mask password
                                 parsed_url = urllib.parse.urlparse(stream_url)
                                 netloc = parsed_url.netloc
-                                if '@' in netloc:
-                                    userpass, hostport = netloc.split('@', 1)
-                                    if ':' in userpass:
-                                        user, _ = userpass.split(':', 1)
+                                if "@" in netloc:
+                                    userpass, hostport = netloc.split("@", 1)
+                                    if ":" in userpass:
+                                        user, _ = userpass.split(":", 1)
                                         masked_netloc = f"{user}:****@{hostport}"
                                         masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
                                         # Create a new masked JSON for logging
@@ -1106,9 +1427,9 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                     logger.debug(f"Error while masking credentials: {mask_err}")
                     if len(body_log) > 1000:
                         body_log = body_log[:997] + "..."
-                
+
                 logger.info(f"REQUEST BODY: {body_log}")
-                
+
                 try:
                     return json.loads(body_raw)
                 except json.JSONDecodeError as e:
@@ -1125,15 +1446,199 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Handle GET requests."""
         try:
+            # Check authentication for protected paths
+            if not self._check_auth():
+                self._send_auth_required()
+                return
+
             # Parse URL and query parameters
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             query = parse_qs(parsed_url.query)
-    
+
             # Get detector_id from query parameters
             detector_id = query.get("detector_id", [""])[0]
-    
-            if path == "/health":
+
+            if path == "/":
+                # Root endpoint - show HTML index page with list of detectors
+                try:
+                    with detector_lock:
+                        # Create a simple HTML page that lists all detectors with links to their view pages
+                        html = (
+                            """
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>YOLO Presence Detection Server</title>
+                            <style>
+                                body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f0f0; }
+                                h1 { color: #333; }
+                                .container { max-width: 1200px; margin: 0 auto; }
+                                .detector-list { list-style: none; padding: 0; }
+                                .detector-card { 
+                                    background-color: #fff; 
+                                    border-radius: 5px; 
+                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                    margin-bottom: 15px; 
+                                    padding: 15px; 
+                                    display: flex;
+                                    justify-content: space-between;
+                                    align-items: center;
+                                }
+                                .detector-info { flex-grow: 1; }
+                                .detector-name { font-weight: bold; font-size: 18px; margin-bottom: 5px; }
+                                .detector-id { color: #666; font-size: 14px; margin-bottom: 5px; }
+                                .detector-model { color: #444; margin-bottom: 5px; }
+                                .detector-resolution { color: #444; margin-bottom: 5px; }
+                                .detector-stats { color: #444; }
+                                .status { 
+                                    display: inline-block;
+                                    padding: 5px 10px; 
+                                    border-radius: 3px; 
+                                    font-weight: bold; 
+                                    margin-bottom: 10px;
+                                }
+                                .connected { background-color: #d4edda; color: #155724; }
+                                .disconnected { background-color: #f8d7da; color: #721c24; }
+                                .reconnecting { background-color: #fff3cd; color: #856404; }
+                                .error { background-color: #f8d7da; color: #721c24; }
+                                .detector-actions { 
+                                    display: flex;
+                                    gap: 10px;
+                                }
+                                .view-button { 
+                                    display: inline-block;
+                                    padding: 8px 15px; 
+                                    background-color: #007bff; 
+                                    color: white; 
+                                    text-decoration: none; 
+                                    border-radius: 3px; 
+                                    font-weight: bold;
+                                }
+                                .view-button:hover { background-color: #0069d9; }
+                                .no-detectors {
+                                    background-color: #fff;
+                                    padding: 20px;
+                                    border-radius: 5px;
+                                    text-align: center;
+                                    color: #666;
+                                }
+                                .server-info {
+                                    background-color: #fff;
+                                    padding: 15px;
+                                    border-radius: 5px;
+                                    margin-bottom: 20px;
+                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                }
+                                .server-info h2 {
+                                    margin-top: 0;
+                                    color: #333;
+                                }
+                                .refresh {
+                                    padding: 10px 15px;
+                                    background-color: #6c757d;
+                                    color: white;
+                                    border: none;
+                                    border-radius: 3px;
+                                    cursor: pointer;
+                                    font-size: 16px;
+                                    margin: 10px 0;
+                                }
+                                .refresh:hover {
+                                    background-color: #5a6268;
+                                }
+                            </style>
+                            <meta http-equiv="refresh" content="30">
+                        </head>
+                        <body>
+                            <div class="container">
+                                <h1>YOLO Presence Detection Server</h1>
+                                
+                                <div class="server-info">
+                                    <h2>Server Status</h2>
+                                    <p>Active detectors: """
+                            + str(len(detectors))
+                            + """</p>
+                                    <p>Server time: """
+                            + time.strftime("%Y-%m-%d %H:%M:%S")
+                            + """</p>
+                                    <button class="refresh" onclick="window.location.reload()">Refresh Now</button>
+                                    <p><small>Page auto-refreshes every 30 seconds</small></p>
+                                </div>
+                                
+                                <h2>Detectors</h2>
+                        """
+                        )
+
+                        if not detectors:
+                            html += """
+                                <div class="no-detectors">
+                                    <p>No active detectors found.</p>
+                                    <p>When a detector connects, it will appear here.</p>
+                                </div>
+                            """
+                        else:
+                            html += '<ul class="detector-list">'
+
+                            for detector_id, detector in detectors.items():
+                                state = detector.get_state()
+
+                                # Format detection information
+                                detection_info = ""
+                                if (
+                                    hasattr(detector, "detected_objects")
+                                    and detector.detected_objects
+                                ):
+                                    items = [
+                                        f"{count} {obj}"
+                                        for obj, count in detector.detected_objects.items()
+                                    ]
+                                    if items:
+                                        detection_info = f"Detected: {', '.join(items)}"
+
+                                html += f"""
+                                    <li class="detector-card">
+                                        <div class="detector-info">
+                                            <div class="detector-name">{detector.name}</div>
+                                            <div class="detector-id">ID: {detector_id}</div>
+                                            <div class="status {detector.connection_status}">{detector.connection_status.upper()}</div>
+                                            <div class="detector-model">Model: {detector.model_name}</div>
+                                            <div class="detector-resolution">Resolution: {detector.input_width}x{detector.input_height}</div>
+                                            <div class="detector-stats">
+                                                People: {detector.people_count}, 
+                                                Pets: {detector.pet_count}
+                                            </div>
+                                            <div class="detector-stats">
+                                                {detection_info}
+                                            </div>
+                                        </div>
+                                        <div class="detector-actions">
+                                            <a class="view-button" href="/view?detector_id={detector_id}">View Stream</a>
+                                        </div>
+                                    </li>
+                                """
+
+                            html += "</ul>"
+
+                        html += """
+                            </div>
+                        </body>
+                        </html>
+                        """
+
+                        # Send the HTML response
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html")
+                        self.send_header("Content-Length", str(len(html.encode())))
+                        self.end_headers()
+                        self.wfile.write(html.encode())
+                        return
+                except Exception as ex:
+                    logger.error(f"Error generating index page: {ex}", exc_info=True)
+                    self._send_error_response(
+                        f"Error generating index page: {str(ex)}", 500
+                    )
+            elif path == "/health":
                 # Health check endpoint
                 self._send_response(
                     {
@@ -1156,10 +1661,14 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                 }
                             )
                         else:
-                            self._send_error_response(f"Detector {detector_id} not found", 404)
+                            self._send_error_response(
+                                f"Detector {detector_id} not found", 404
+                            )
                 except Exception as ex:
                     logger.error(f"Error getting detector state: {ex}", exc_info=True)
-                    self._send_error_response(f"Error getting detector state: {str(ex)}", 500)
+                    self._send_error_response(
+                        f"Error getting detector state: {str(ex)}", 500
+                    )
             elif path == "/detectors":
                 # List all detectors
                 try:
@@ -1174,104 +1683,334 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     "connection_status": detector.connection_status,
                                 }
                             )
-                        self._send_response({"status": "success", "detectors": detector_list})
+                        self._send_response(
+                            {"status": "success", "detectors": detector_list}
+                        )
                 except Exception as ex:
                     logger.error(f"Error listing detectors: {ex}", exc_info=True)
-                    self._send_error_response(f"Error listing detectors: {str(ex)}", 500)
+                    self._send_error_response(
+                        f"Error listing detectors: {str(ex)}", 500
+                    )
+            elif path == "/stream" and detector_id:
+                # Stream the latest annotated frame as MJPEG
+                try:
+                    with detector_lock:
+                        if detector_id not in detectors:
+                            self._send_error_response(
+                                f"Detector {detector_id} not found", 404
+                            )
+                            return
+
+                        detector = detectors[detector_id]
+
+                        # Check if we have an annotated frame
+                        if detector.last_annotated_frame is None:
+                            self._send_error_response(
+                                "No annotated frame available yet", 404
+                            )
+                            return
+
+                        # Set MJPEG stream headers
+                        boundary = "mjpegboundary"
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type",
+                            f"multipart/x-mixed-replace; boundary={boundary}",
+                        )
+                        self.send_header(
+                            "Cache-Control", "no-cache, no-store, must-revalidate"
+                        )
+                        self.send_header("Pragma", "no-cache")
+                        self.send_header("Expires", "0")
+                        self.end_headers()
+
+                        # Create a placeholder frame with a message if no annotated frame is available
+                        def create_placeholder_frame():
+                            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                            cv2.putText(
+                                placeholder,
+                                "Waiting for detection...",
+                                (50, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1,
+                                (255, 255, 255),
+                                2,
+                            )
+                            return placeholder
+
+                        # Stream frames indefinitely
+                        while True:
+                            # Use detector lock to safely access the frame
+                            with detector_lock:
+                                if detector_id not in detectors:
+                                    logger.info(
+                                        f"Detector {detector_id} no longer exists, ending stream"
+                                    )
+                                    break
+
+                                detector = detectors[detector_id]
+
+                                # Get the latest frame or a placeholder if none available
+                                if (
+                                    detector.last_annotated_frame is not None
+                                    and detector.last_annotated_time > 0
+                                ):
+                                    frame_to_send = detector.last_annotated_frame.copy()
+
+                                    # Add "live" indicator
+                                    current_time = time.strftime("%H:%M:%S")
+                                    cv2.putText(
+                                        frame_to_send,
+                                        f"Live: {current_time}",
+                                        (frame_to_send.shape[1] - 180, 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        (0, 255, 255),
+                                        2,
+                                    )
+                                else:
+                                    frame_to_send = create_placeholder_frame()
+
+                            # Send the frame
+                            if not self._send_mjpeg_frame(frame_to_send, boundary):
+                                # Client disconnected or error occurred
+                                break
+
+                            # Sleep for a bit to control frame rate (5 FPS is fine for this)
+                            time.sleep(0.2)
+
+                        logger.info(f"MJPEG stream for detector {detector_id} ended")
+                        return
+                except Exception as ex:
+                    logger.error(f"Error streaming frames: {ex}", exc_info=True)
+                    self._send_error_response(f"Error streaming frames: {str(ex)}", 500)
+            elif path == "/view" and detector_id:
+                # Return an HTML page with the stream embedded
+                try:
+                    with detector_lock:
+                        if detector_id not in detectors:
+                            self._send_error_response(
+                                f"Detector {detector_id} not found", 404
+                            )
+                            return
+
+                        detector = detectors[detector_id]
+
+                        # Create a simple HTML page with the embedded MJPEG stream
+                        html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>YOLO Detector: {detector.name}</title>
+                            <style>
+                                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; text-align: center; background-color: #f0f0f0; }}
+                                h1 {{ color: #333; }}
+                                .container {{ max-width: 1200px; margin: 0 auto; }}
+                                .stream {{ 
+                                    width: 100%; 
+                                    max-width: 1024px; 
+                                    margin: 20px auto; 
+                                    border: 2px solid #333; 
+                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1); 
+                                }}
+                                .info {{ 
+                                    background-color: #fff; 
+                                    padding: 15px; 
+                                    border-radius: 5px; 
+                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                    margin: 20px auto;
+                                    max-width: 1024px;
+                                    text-align: left;
+                                }}
+                                .detector-name {{ font-weight: bold; font-size: 18px; }}
+                                .status {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; }}
+                                .connected {{ background-color: #d4edda; color: #155724; }}
+                                .disconnected {{ background-color: #f8d7da; color: #721c24; }}
+                                .reconnecting {{ background-color: #fff3cd; color: #856404; }}
+                                .error {{ background-color: #f8d7da; color: #721c24; }}
+                                .refresh {{ 
+                                    padding: 10px 15px; 
+                                    background-color: #007bff; 
+                                    color: white; 
+                                    border: none; 
+                                    border-radius: 3px; 
+                                    cursor: pointer; 
+                                    font-size: 16px;
+                                }}
+                                .refresh:hover {{ background-color: #0069d9; }}
+                            </style>
+                        </head>
+                        <body>
+                            <div class="container">
+                                <h1>YOLO Detector Live Stream</h1>
+                                
+                                <div class="info">
+                                    <p class="detector-name">Name: {detector.name}</p>
+                                    <p>Detector ID: {detector.detector_id}</p>
+                                    <p>Model: {detector.model_name}</p>
+                                    <p>Status: <span class="status {detector.connection_status}">{detector.connection_status}</span></p>
+                                    <p>Resolution: {detector.input_width}x{detector.input_height}</p>
+                                    <p>Confidence threshold: {detector.confidence_threshold}</p>
+                                    <p>Auto-optimization: {"Enabled" if detector.auto_optimization else "Disabled"}</p>
+                                </div>
+                                
+                                <img src="/stream?detector_id={detector_id}" class="stream" alt="Live detection stream" />
+                                
+                                <p>
+                                    <button class="refresh" onclick="window.location.reload()">Refresh Page</button>
+                                </p>
+                            </div>
+                        </body>
+                        </html>
+                        """
+
+                        # Send the HTML response
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html")
+                        self.send_header("Content-Length", str(len(html.encode())))
+                        self.end_headers()
+                        self.wfile.write(html.encode())
+                        return
+                except Exception as ex:
+                    logger.error(f"Error generating view page: {ex}", exc_info=True)
+                    self._send_error_response(
+                        f"Error generating view page: {str(ex)}", 500
+                    )
             else:
                 self._send_error_response("Invalid endpoint", 404)
         except Exception as e:
             logger.error(f"Unhandled exception in do_GET: {e}", exc_info=True)
             try:
-                self._send_error_response(f"Internal server error", 500)
-            except:
+                self._send_error_response("Internal server error", 500)
+            except Exception as send_err:
                 logger.error("Failed to send error response", exc_info=True)
 
     def do_POST(self) -> None:
         """Handle POST requests."""
         try:
+            # We don't check authentication for POST requests since they're used by the Home Assistant integration
+            # If you want to add authentication to POST endpoints as well, uncomment and modify the lines below
+            # if path in ["/custom_protected_endpoint"]:
+            #     if not self._check_auth():
+            #         self._send_auth_required()
+            #         return
+
             # Parse URL
             parsed_url = urlparse(self.path)
             path = parsed_url.path
-    
+
             # Parse request body
             body = self._parse_json_body()
-    
+
             if path == "/poll":
                 try:
                     # Poll endpoint - create or update detector, perform detection, and get state
                     detector_id = body.get("detector_id")
-    
+
                     if not detector_id:
                         self._send_error_response("detector_id is required")
                         return
-    
+
                     # Get detector configuration from request
                     config = body.get("config", {})
-                    
+
                     try:
                         # Create or update detector
                         result = create_or_update_detector(detector_id, config)
-                        
+
                         # If detector is successfully created/updated, perform detection
-                        if result.get("status") == "success" and detector_id in detectors:
+                        if (
+                            result.get("status") == "success"
+                            and detector_id in detectors
+                        ):
                             try:
                                 detector = detectors[detector_id]
-                                
+
                                 # Perform detection on current frame
                                 detection_start = time.time()
-                                logger.info(f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}")
-                                
+                                logger.info(
+                                    f"Performing detection for {detector_id} on poll request - interval: {detector.detection_interval}s, auto_optimization: {detector.auto_optimization}"
+                                )
+
                                 try:
                                     detection_success = detector.perform_detection()
                                     detection_time = time.time() - detection_start
-                                    
+
                                     if detection_success:
                                         # Get the detailed detection information
                                         detection_info = ""
-                                        if hasattr(detector, "detected_objects") and detector.detected_objects:
-                                            items = [f"{count} {obj}" for obj, count in detector.detected_objects.items()]
-                                            detection_info = f" - Found: {', '.join(items)}"
-                                        
+                                        if (
+                                            hasattr(detector, "detected_objects")
+                                            and detector.detected_objects
+                                        ):
+                                            items = [
+                                                f"{count} {obj}"
+                                                for obj, count in detector.detected_objects.items()
+                                            ]
+                                            detection_info = (
+                                                f" - Found: {', '.join(items)}"
+                                            )
+
                                         # Log with additional info
                                         logger.info(
                                             f"Detection completed in {detection_time:.3f}s for {detector_id}{detection_info}"
                                         )
-                                        
+
                                         # Get updated state after detection
                                         result["state"] = detector.get_state()
                                         result["detection_time"] = detection_time
                                     else:
-                                        logger.warning(f"Detection failed for {detector_id}")
+                                        logger.warning(
+                                            f"Detection failed for {detector_id}"
+                                        )
                                         result["detection_failed"] = True
-                                        
+
                                 except Exception as detection_err:
-                                    logger.error(f"Error during detection for {detector_id}: {detection_err}", exc_info=True)
+                                    logger.error(
+                                        f"Error during detection for {detector_id}: {detection_err}",
+                                        exc_info=True,
+                                    )
                                     result["status"] = "error"
-                                    result["message"] = f"Detection error: {str(detection_err)}"
+                                    result["message"] = (
+                                        f"Detection error: {str(detection_err)}"
+                                    )
                                     result["detection_failed"] = True
                             except Exception as detector_err:
-                                logger.error(f"Error accessing detector {detector_id}: {detector_err}", exc_info=True)
+                                logger.error(
+                                    f"Error accessing detector {detector_id}: {detector_err}",
+                                    exc_info=True,
+                                )
                                 result["status"] = "error"
-                                result["message"] = f"Detector access error: {str(detector_err)}"
-                        
+                                result["message"] = (
+                                    f"Detector access error: {str(detector_err)}"
+                                )
+
                         self._send_response(result)
                     except Exception as create_err:
-                        logger.error(f"Error creating/updating detector {detector_id}: {create_err}", exc_info=True)
-                        self._send_error_response(f"Error creating/updating detector: {str(create_err)}", 500)
+                        logger.error(
+                            f"Error creating/updating detector {detector_id}: {create_err}",
+                            exc_info=True,
+                        )
+                        self._send_error_response(
+                            f"Error creating/updating detector: {str(create_err)}", 500
+                        )
                 except Exception as poll_err:
-                    logger.error(f"Error processing poll request: {poll_err}", exc_info=True)
-                    self._send_error_response(f"Error processing poll request: {str(poll_err)}", 500)
-    
+                    logger.error(
+                        f"Error processing poll request: {poll_err}", exc_info=True
+                    )
+                    self._send_error_response(
+                        f"Error processing poll request: {str(poll_err)}", 500
+                    )
+
             elif path == "/shutdown":
                 try:
                     # Shutdown detector
                     detector_id = body.get("detector_id")
-    
+
                     if not detector_id:
                         self._send_error_response("detector_id is required")
                         return
-    
+
                     with detector_lock:
                         if detector_id in detectors:
                             try:
@@ -1285,20 +2024,34 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     }
                                 )
                             except Exception as shutdown_err:
-                                logger.error(f"Error shutting down detector {detector_id}: {shutdown_err}", exc_info=True)
-                                self._send_error_response(f"Error shutting down detector: {str(shutdown_err)}", 500)
+                                logger.error(
+                                    f"Error shutting down detector {detector_id}: {shutdown_err}",
+                                    exc_info=True,
+                                )
+                                self._send_error_response(
+                                    f"Error shutting down detector: {str(shutdown_err)}",
+                                    500,
+                                )
                         else:
-                            self._send_error_response(f"Detector {detector_id} not found", 404)
+                            self._send_error_response(
+                                f"Detector {detector_id} not found", 404
+                            )
                 except Exception as shutdown_req_err:
-                    logger.error(f"Error processing shutdown request: {shutdown_req_err}", exc_info=True)
-                    self._send_error_response(f"Error processing shutdown request: {str(shutdown_req_err)}", 500)
+                    logger.error(
+                        f"Error processing shutdown request: {shutdown_req_err}",
+                        exc_info=True,
+                    )
+                    self._send_error_response(
+                        f"Error processing shutdown request: {str(shutdown_req_err)}",
+                        500,
+                    )
             else:
                 self._send_error_response("Invalid endpoint", 404)
         except Exception as e:
             logger.error(f"Unhandled exception in do_POST: {e}", exc_info=True)
             try:
-                self._send_error_response(f"Internal server error", 500)
-            except:
+                self._send_error_response("Internal server error", 500)
+            except Exception as send_err:
                 logger.error("Failed to send error response", exc_info=True)
 
 
@@ -1309,22 +2062,24 @@ def start_http_server() -> None:
         # Customize the HTTP server for better error handling
         class RobustHTTPServer(HTTPServer):
             """Enhanced HTTP server with improved error handling."""
-            
+
             def handle_error(self, request, client_address):
                 """Handle errors occurring during request processing."""
                 # Extract the client IP
                 client_ip = client_address[0] if client_address else "unknown"
-                
+
                 # Log the error with traceback
-                logger.error(f"Error processing request from {client_ip}:", exc_info=True)
-                
+                logger.error(
+                    f"Error processing request from {client_ip}:", exc_info=True
+                )
+
                 # Don't close the socket on errors
                 return
-        
+
         # Create the server with robust error handling
         server = RobustHTTPServer(("0.0.0.0", HTTP_PORT), YoloHTTPHandler)
         server.timeout = 60  # Set a timeout for socket operations
-        
+
         # Log server startup information
         logger.info(f"Starting HTTP server on port {HTTP_PORT}")
         logger.info(f"Python version: {sys.version}")
@@ -1335,7 +2090,7 @@ def start_http_server() -> None:
         if torch.cuda.is_available():
             logger.info(f"CUDA version: {torch.version.cuda}")
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            
+
         # Start the server loop with restart capability
         try:
             logger.info("Server started and ready to handle requests")
@@ -1344,10 +2099,12 @@ def start_http_server() -> None:
             logger.info("Server stopped by keyboard interrupt")
         except Exception as loop_ex:
             logger.error(f"Error in server main loop: {loop_ex}", exc_info=True)
-            
+
     except OSError as os_err:
         if os_err.errno == 98:  # Address already in use
-            logger.error(f"Port {HTTP_PORT} is already in use. Is another instance running?")
+            logger.error(
+                f"Port {HTTP_PORT} is already in use. Is another instance running?"
+            )
         else:
             logger.error(f"OS error starting server: {os_err}", exc_info=True)
     except KeyboardInterrupt:
@@ -1356,7 +2113,7 @@ def start_http_server() -> None:
         logger.error(f"Error starting server: {ex}", exc_info=True)
     finally:
         logger.info("Server shutting down")
-        
+
         # Shutdown the server properly if it was created
         if server:
             try:
@@ -1364,7 +2121,7 @@ def start_http_server() -> None:
                 server.server_close()
             except Exception as server_err:
                 logger.error(f"Error shutting down HTTP server: {server_err}")
-        
+
         # Cleanup all detectors
         with detector_lock:
             for detector_id, detector in list(detectors.items()):
@@ -1372,9 +2129,11 @@ def start_http_server() -> None:
                     logger.info(f"Shutting down detector {detector_id}...")
                     detector.shutdown()
                 except Exception as det_err:
-                    logger.error(f"Error shutting down detector {detector_id}: {det_err}")
+                    logger.error(
+                        f"Error shutting down detector {detector_id}: {det_err}"
+                    )
             detectors.clear()
-            
+
         logger.info("Server shutdown complete")
 
 

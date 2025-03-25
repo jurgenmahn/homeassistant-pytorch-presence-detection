@@ -45,11 +45,40 @@ The server will be available at http://localhost:5505.
 
 ## API Endpoints
 
+- `GET /`: Main web interface with a list of all active detectors
 - `GET /health`: Get server health status
 - `GET /detectors`: List all active detectors
+- `GET /view?detector_id=ID`: HTML view of a specific detector with live stream
+- `GET /stream?detector_id=ID`: MJPEG stream of a specific detector
 - `POST /poll`: Main endpoint for detection polling
 - `POST /shutdown`: Gracefully shut down a detector
 - `GET /state`: Get current detector state
+
+## Web Interface
+
+The server includes a web interface for visual monitoring of detectors:
+
+- **Home Page** (`/`): Lists all active detectors with status and statistics
+- **Detector View** (`/view?detector_id=ID`): Shows a live MJPEG stream from a specific detector with detection information
+- **Direct Stream** (`/stream?detector_id=ID`): Raw MJPEG stream that can be embedded in other applications
+
+Features:
+- Live object detection visualization with bounding boxes
+- Detection statistics display
+- Connection status monitoring
+- Auto-refreshing detector list
+- Mobile-friendly responsive layout
+- Optional basic authentication protection
+
+### Accessing the Web Interface
+
+By default, the web interface is available at `http://<server-ip>:5505/`. If authentication is enabled, you'll be prompted to enter the configured username and password.
+
+### Authentication
+
+For security in shared environments, you can enable basic authentication for the web interface by setting `ENABLE_AUTH=true` in the docker-compose.yml file. When enabled, the web interface will require login with the configured credentials. 
+
+The API endpoints used by Home Assistant are not protected by authentication to ensure compatibility.
 
 ### Poll Endpoint
 
@@ -97,8 +126,16 @@ The `/poll` endpoint is the primary API endpoint, used for creating/updating det
 
 The following environment variables can be set in the `docker-compose.yml` file:
 
+### Basic Server Settings
 - `HTTP_PORT`: The port to run the server on (default: 5505)
 - `DEBUG`: Enable debug mode (default: false)
+
+### Web Interface Authentication
+- `ENABLE_AUTH`: Enable basic authentication for web interface (default: false)
+- `AUTH_USERNAME`: Username for basic authentication (default: admin)
+- `AUTH_PASSWORD`: Password for basic authentication (default: yolopassword)
+
+Authentication is applied only to the web interface endpoints (`/`, `/view`, `/stream`), not to the API endpoints used by Home Assistant.
 
 ## Usage with Home Assistant
 
