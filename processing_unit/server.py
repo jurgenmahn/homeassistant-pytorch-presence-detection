@@ -205,15 +205,10 @@ class YoloDetector:
             return False
 
         try:
-            logger.info(f"Opening stream: {self.stream_url}")
-
-            # Parse URL to check and possibly sanitize
+            # Parse URL to mask password in logs
             try:
                 parsed_url = urllib.parse.urlparse(self.stream_url)
-                # Extract components safely
-                scheme = parsed_url.scheme
                 netloc = parsed_url.netloc
-                path = parsed_url.path
                 
                 # Log masked URL (hide password)
                 if '@' in netloc:
@@ -223,146 +218,63 @@ class YoloDetector:
                         masked_netloc = f"{user}:****@{hostport}"
                     else:
                         masked_netloc = f"{userpass}@{hostport}"
+                    
+                    masked_url = f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
+                    logger.info(f"Opening stream: {masked_url}")
                 else:
-                    masked_netloc = netloc
-                
-                masked_url = f"{scheme}://{masked_netloc}{path}"
-                logger.info(f"Connecting to RTSP stream: {masked_url}")
-            except Exception as ex:
-                logger.warning(f"Error parsing RTSP URL: {ex}")
+                    logger.info(f"Opening stream: {self.stream_url}")
+            except Exception:
+                logger.info(f"Opening stream (URL parsing failed)")
             
-            # Try multiple connection methods one by one
-            if self.stream_url.startswith("rtsp://"):
-                connection_methods = []
-                
-                # 1. If CUDA is available, try GStreamer with NVIDIA acceleration
-                if self.device.startswith("cuda"):
-                    connection_methods.append({
-                        "name": "NVIDIA GStreamer pipeline",
-                        "func": lambda: self._try_nvidia_gstreamer()
-                    })
-                
-                # 2. Try generic GStreamer pipeline
-                connection_methods.append({
-                    "name": "Generic GStreamer pipeline",
-                    "func": lambda: self._try_generic_gstreamer()
-                })
-                
-                # 3. Try OpenCV with TCP transport
-                connection_methods.append({
-                    "name": "OpenCV with TCP transport",
-                    "func": lambda: self._try_opencv_tcp()
-                })
-                
-                # 4. Try OpenCV with UDP transport
-                connection_methods.append({
-                    "name": "OpenCV with UDP transport",
-                    "func": lambda: self._try_opencv_udp()
-                })
-                
-                # 5. Try FFmpeg directly if system has it
-                connection_methods.append({
-                    "name": "FFmpeg direct",
-                    "func": lambda: self._try_ffmpeg_direct()
-                })
-                
-                # Try each method until one succeeds
-                for method in connection_methods:
-                    logger.info(f"Trying connection method: {method['name']}")
-                    success = method["func"]()
-                    if success and self.cap and self.cap.isOpened():
-                        logger.info(f"Successfully connected using {method['name']}")
-                        return True
-                
-                # If we get here, all methods failed
-                logger.error(f"All connection methods failed for stream")
-                return False
-            else:
-                # Non-RTSP stream, use regular OpenCV
-                logger.info("Using default OpenCV capture for non-RTSP stream")
-                self.cap = cv2.VideoCapture(self.stream_url)
+            # Close any existing stream
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+            
+            # Open the stream with OpenCV
+            self.cap = cv2.VideoCapture(self.stream_url)
+            
+            # Configure stream parameters if opened successfully
+            if self.cap.isOpened():
+                # Configure for optimal streaming performance
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Small buffer to reduce latency
-                return self.cap.isOpened()
-
+                
+                # For RTSP streams, set additional parameters
+                if self.stream_url.startswith("rtsp://"):
+                    # Try to set preferred codec
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
+                    
+                    # Use TCP transport for better reliability
+                    self.cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 0)  # 0=TCP (more reliable), 1=UDP
+                    
+                    # Set preferred frame rate
+                    self.cap.set(cv2.CAP_PROP_FPS, 15)
+                
+                # Verify the connection by attempting to read a frame
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    logger.info(f"Stream opened and verified for {self.detector_id}")
+                    return True
+                else:
+                    logger.warning(f"Stream opened but failed to read frame for {self.detector_id}")
+                    self.cap.release()
+                    self.cap = None
+                    return False
+            else:
+                logger.error(f"Failed to open stream for {self.detector_id}")
+                return False
+                
         except Exception as ex:
-            logger.error(f"Error opening stream {self.stream_url}: {ex}", exc_info=True)
-            return False
-
-    def _try_nvidia_gstreamer(self) -> bool:
-        """Try NVIDIA hardware-accelerated GStreamer pipeline."""
-        try:
-            gst_pipeline = (
-                f"rtspsrc location={self.stream_url} latency=0 drop-on-latency=true ! "
-                f"rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! "
-                f"video/x-raw, format=BGRx ! videoconvert ! "
-                f"video/x-raw, format=BGR ! appsink drop=true sync=false"
-            )
-            self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-            return self.cap.isOpened()
-        except Exception as ex:
-            logger.warning(f"NVIDIA GStreamer pipeline failed: {ex}")
-            return False
-    
-    def _try_generic_gstreamer(self) -> bool:
-        """Try generic GStreamer pipeline."""
-        try:
-            gst_pipeline = (
-                f"rtspsrc location={self.stream_url} latency=0 drop-on-latency=true ! "
-                f"rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-                f"video/x-raw, format=BGR ! appsink drop=true sync=false"
-            )
-            self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-            return self.cap.isOpened()
-        except Exception as ex:
-            logger.warning(f"Generic GStreamer pipeline failed: {ex}")
-            return False
-    
-    def _try_opencv_tcp(self) -> bool:
-        """Try OpenCV with TCP transport."""
-        try:
-            self.cap = cv2.VideoCapture(self.stream_url)
-            if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-                self.cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 0)  # TCP
-                self.cap.set(cv2.CAP_PROP_FPS, 15)
-                # Read one frame to verify connection is working
-                ret, _ = self.cap.read()
-                return ret
-            return False
-        except Exception as ex:
-            logger.warning(f"OpenCV TCP connection failed: {ex}")
-            return False
-    
-    def _try_opencv_udp(self) -> bool:
-        """Try OpenCV with UDP transport."""
-        try:
-            self.cap = cv2.VideoCapture(self.stream_url)
-            if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'H264'))
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-                self.cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 1)  # UDP
-                self.cap.set(cv2.CAP_PROP_FPS, 15)
-                # Read one frame to verify connection is working
-                ret, _ = self.cap.read()
-                return ret
-            return False
-        except Exception as ex:
-            logger.warning(f"OpenCV UDP connection failed: {ex}")
-            return False
-    
-    def _try_ffmpeg_direct(self) -> bool:
-        """Try using FFmpeg command directly."""
-        try:
-            # Try to create a custom FFmpeg pipeline
-            ffmpeg_pipeline = (
-                f"ffmpeg -rtsp_transport tcp -i {self.stream_url} "
-                f"-f rawvideo -pix_fmt bgr24 -vsync drop -an -"
-            )
-            self.cap = cv2.VideoCapture(ffmpeg_pipeline, cv2.CAP_FFMPEG)
-            return self.cap.isOpened()
-        except Exception as ex:
-            logger.warning(f"FFmpeg direct connection failed: {ex}")
+            logger.error(f"Error opening stream: {ex}", exc_info=True)
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
             return False
 
     def _detection_loop(self) -> None:
