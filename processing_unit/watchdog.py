@@ -443,6 +443,8 @@ class SocketWatchdog:
         """
         Check if the socket is open and accepting connections.
         
+        Uses a "ping" type message that's designed specifically for watchdog health checks.
+        
         Returns:
             bool: True if socket is healthy, False otherwise
         """
@@ -460,10 +462,13 @@ class SocketWatchdog:
             
             # Additional check: Try to send/receive data
             try:
-                # Send a valid message format that the server would expect
-                # Use heartbeat message instead of auth (less disruptive)
+                # Send a special watchdog ping message
+                # This is specifically designed for health checks and won't
+                # interfere with normal detector operations
                 test_message = {
-                    "type": "heartbeat"
+                    "type": "watchdog_ping",
+                    "client_id": "socket_watchdog",
+                    "timestamp": time.time()
                 }
                 
                 import json
@@ -473,11 +478,17 @@ class SocketWatchdog:
                 # Send message length followed by message
                 sock.sendall(length_bytes + message_bytes)
                 
-                # Try to receive response (read the full message)
-                # First read the length
-                response_length_bytes = sock.recv(4)
-                if not response_length_bytes or len(response_length_bytes) != 4:
-                    logger.warning("Socket check failed: couldn't receive response length")
+                # Try to receive response with short timeout
+                # First read the length with an even shorter timeout
+                try:
+                    # Start with a short timeout just for the length
+                    sock.settimeout(2)
+                    response_length_bytes = sock.recv(4)
+                    if not response_length_bytes or len(response_length_bytes) != 4:
+                        logger.warning("Socket check failed: couldn't receive response length")
+                        return False
+                except self.socket.timeout:
+                    logger.warning("Socket check failed: timeout receiving response length")
                     return False
                     
                 # Parse the length
@@ -485,6 +496,9 @@ class SocketWatchdog:
                 if response_length <= 0 or response_length > 1024 * 1024:  # Max 1MB
                     logger.warning(f"Socket check failed: invalid response length {response_length}")
                     return False
+                    
+                # Set a slightly longer timeout for data
+                sock.settimeout(3)
                     
                 # Now read the response data
                 data = b""
@@ -500,7 +514,7 @@ class SocketWatchdog:
                 # Try to parse the response
                 try:
                     response = json.loads(data.decode("utf-8"))
-                    # Look for heartbeat_response or any valid message type
+                    # Look for watchdog_pong or any valid message type
                     if "type" in response:
                         logger.debug(f"Socket check succeeded: received {response.get('type')} response")
                         return True
@@ -710,7 +724,12 @@ def restart_server_process():
                     
                     # Try to restart gracefully first
                     logger.info(f"Sending SIGHUP to PID {proc.pid}")
-                    os.kill(proc.pid, signal.SIGHUP)
+                    try:
+                        import signal
+                        import os
+                        os.kill(proc.pid, signal.SIGHUP)
+                    except Exception as err:
+                        logger.warning(f"Failed to send SIGHUP signal: {err}")
                     
                     # Wait a bit for graceful restart
                     time.sleep(5)
@@ -719,7 +738,10 @@ def restart_server_process():
                     if psutil.pid_exists(proc.pid):
                         # If still running, terminate more forcefully
                         logger.info(f"Process still running, sending SIGTERM to PID {proc.pid}")
-                        os.kill(proc.pid, signal.SIGTERM)
+                        try:
+                            os.kill(proc.pid, signal.SIGTERM)
+                        except Exception as err:
+                            logger.warning(f"Failed to send SIGTERM signal: {err}")
                         
                         # Wait for termination
                         time.sleep(5)
@@ -727,7 +749,10 @@ def restart_server_process():
                         # If still running, kill forcefully
                         if psutil.pid_exists(proc.pid):
                             logger.warning(f"Process still running, sending SIGKILL to PID {proc.pid}")
-                            os.kill(proc.pid, signal.SIGKILL)
+                            try:
+                                os.kill(proc.pid, signal.SIGKILL)
+                            except Exception as err:
+                                logger.warning(f"Failed to send SIGKILL signal: {err}")
                     
                     # Process should be dead by now, wait a moment before starting new one
                     time.sleep(5)
@@ -738,12 +763,13 @@ def restart_server_process():
         # Start a new server process
         # Get the path to server.py
         try:
+            import os
             import os.path
             server_script = os.path.join(os.path.dirname(__file__), 'server.py')
             
             if os.path.exists(server_script):
                 logger.info(f"Starting new server process: {server_script}")
-                subprocess.Popen(['python', server_script], 
+                subprocess.Popen([sys.executable, server_script], 
                                  stdout=subprocess.PIPE, 
                                  stderr=subprocess.PIPE)
                 logger.info("Server process started")
