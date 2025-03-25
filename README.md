@@ -2,27 +2,30 @@
 
 This integration provides presence detection using YOLO object detection on camera streams. It uses a separate processing server to handle the video processing and ML inference, while providing seamless integration with Home Assistant entities and automations.
 
-## Major Update: New Architecture
+## Major Update: Poll-Based Architecture
 
-This is a major update to the YOLO Presence Detection integration, introducing a new split architecture:
+This is a major update to the YOLO Presence Detection integration, introducing a new poll-based HTTP architecture:
 
-1. **Home Assistant Integration**: Handles the UI, configuration, entities, and events within Home Assistant
-2. **Processing Server**: A separate Docker container that handles video stream processing and ML inference
+1. **Home Assistant Integration**: Controls when detection happens through regular HTTP polling
+2. **Processing Server**: A separate Docker container that maintains stream connections and performs detection on demand
 
 This architecture provides several benefits:
-- **Python Version Compatibility**: Home Assistant requires Python 3.13, but PyTorch and Ultralytics don't fully support Python 3.13 yet
-- **Resource Isolation**: Processing can happen on a separate machine with a GPU
-- **Reduced Dependencies**: The HA component has minimal dependencies
-- **Scalability**: Multiple HA instances can connect to a single processing server, or one server can handle multiple cameras
+- **Reliability**: Stream connections are maintained in the background, but resource-intensive detection only happens when requested
+- **Control**: Home Assistant controls the frequency of detection through configurable polling intervals
+- **Resource Management**: Processing server can handle multiple streams efficiently with automatic resource optimization
+- **Resilience**: Polling architecture is more resilient to network issues and interruptions
+- **Recovery**: Automatic reconnection and health monitoring ensures continuous operation
 
 ## Features
 
 - **Person Detection**: Detects when people are present in the camera feed
 - **Pet Detection**: Detects cats and dogs in the camera feed
 - **Counting**: Counts the number of people and pets detected
-- **GPU Acceleration**: Automatically uses GPU acceleration (CUDA/ROCm) when available
+- **GPU Acceleration**: Automatically uses GPU acceleration (CUDA) when available
 - **Adjustable Parameters**: Configure detection thresholds, intervals, and resolution
 - **Multiple Models**: Choose from different YOLO models based on your hardware capabilities
+- **Auto-Optimization**: Optional automatic resource management based on system usage
+- **Detailed Logging**: Comprehensive logging with masked credentials for security
 
 ## Installation
 
@@ -37,7 +40,7 @@ cd processing_unit
 docker-compose up -d
 ```
 
-For more details, see the [processing server README](../../processing_unit/README.md).
+For more details, see the processing server documentation below.
 
 ### Step 2: Install the Home Assistant Integration
 
@@ -100,20 +103,37 @@ The integration fires the following events:
 | Stream URL | RTSP URL of the camera | Required |
 | Auto-Optimization | Enable automatic resource optimization | Disabled |
 | Model | YOLO model to use | YOLOv11L |
-| Detection Interval | Seconds between detections | 5s (GPU), 10s (CPU) |
+| Detection Interval | Seconds between detection polls | 10s (CPU), 5s (GPU) |
 | Confidence Threshold | Minimum detection confidence (0.1-0.9) | 0.25 |
-| Input Resolution | Resolution for processing | 640x480 |
-| Frame Skip Rate | Process 1 out of X frames | 3 (GPU), 5 (CPU) |
+| Input Resolution | Resolution for processing (adjusted to be multiple of 32) | 640x480 |
+| Frame Skip Rate | Process 1 out of X frames | 5 (CPU), 3 (GPU) |
+
+### Poll-Based Detection
+
+The integration uses a poll-based architecture where:
+
+- Home Assistant polls the server at regular intervals (as set by Detection Interval)
+- The server maintains camera stream connections in the background
+- Detection only happens when a poll request is received
+- Results are returned immediately in the HTTP response
+- Each poll includes the full detector configuration
+
+Benefits of this approach:
+- Reduced resource usage when detection isn't needed
+- Client controls exactly when detection happens
+- More resilient to network interruptions
+- Easier to monitor and debug
+- Configurable detection frequency
 
 ### Auto-Optimization
 
 The integration includes an automatic resource optimization feature that:
 
 - Automatically adjusts detection settings based on server resource usage
-- Dynamically selects the optimal model, resolution, and frame rate
 - Monitors CPU, memory, and GPU usage in real-time
 - Scales back resource usage when the server is under heavy load
 - Improves performance automatically when resources are available
+- Adjusts parameters based on stream connection health
 
 When auto-optimization is enabled:
 - Manual configuration fields for model, interval, resolution, etc. are disabled
@@ -124,7 +144,7 @@ When auto-optimization is enabled:
 
 ### For the Processing Server:
 - Any machine capable of running Docker
-- For GPU acceleration: NVIDIA GPU with CUDA support or AMD GPU with ROCm support
+- For GPU acceleration: NVIDIA GPU with CUDA support
 - At least 4GB of RAM (8GB+ recommended for larger models)
 
 ### For Home Assistant:
@@ -140,27 +160,48 @@ When auto-optimization is enabled:
 
 ## Troubleshooting
 
-- If you experience connection issues, verify that your processing server is running and accessible from Home Assistant
-- Check that your camera stream URL is correct and accessible from the processing server
-- For CPU resource issues, try using a smaller model (nano or small) and increasing the detection interval
-- See the logs for more detailed error messages
+- **HTTP Polling Issues**: If entities aren't updating, check that the configured detection interval is appropriate
+- **Inconsistent Detection**: Try increasing the confidence threshold or using a more accurate model
+- **High CPU Usage**: Use a smaller model or increase the detection interval
+- **Memory Issues**: Lower the input resolution or reduce the frame skip rate
+- **Connection Problems**: Verify your RTSP URL is correct and accessible from the processing server
+- **Performance Insights**: Review the detector output in the logs, which includes detailed information about:
+  - Detection times in milliseconds
+  - Original frame dimensions vs. model input dimensions
+  - Auto-optimization status and adjustments
+  - Detected objects and their counts
 
-## Automatic Detector Recovery
+## RTSP Stream Compatibility
 
-The integration includes a detector health monitoring system that:
+The system supports various RTSP stream formats:
 
-- Checks every minute if each configured detector is running on the server
-- Monitors detector responses to verify they're properly functioning
-- Automatically recreates detectors if they're missing or not responding
-- Ensures continuous operation even if the processing server restarts
+- Standard RTSP streams from IP cameras
+- RTSP streams with credentials (username:password format)
+- HTTP video streams
+- ONVIF-compliant camera streams
 
-This feature helps maintain system reliability by automatically recovering from:
-- Server restarts or crashes
-- Network interruptions
-- Configuration loss on the server side
-- Detector process termination
+For optimal performance:
+- Configure your camera for H.264 encoding when possible
+- Use a resolution appropriate for detection (720p or lower recommended)
+- Ensure your network has sufficient bandwidth between the processing server and camera
 
-The health check runs in the background and requires no manual intervention.
+## Processing Server Architecture
+
+The processing server component has the following key components:
+
+1. **HTTP Server**: Handles requests from Home Assistant clients
+2. **YOLO Model Management**: Loads and configures YOLO models for detection
+3. **Stream Monitor**: Background threads that maintain camera connections
+4. **Detector Instances**: One per configured camera, maintaining state
+5. **Resource Monitor**: Monitors system resources for auto-optimization
+
+### API Endpoints
+
+- `GET /health`: Server health check
+- `POST /poll`: Main endpoint for detection polling
+- `POST /shutdown`: Gracefully shut down a detector
+- `GET /state`: Get current detector state
+- `GET /detectors`: List all active detectors
 
 ## License
 
@@ -168,75 +209,14 @@ This project is licensed under the MIT License.
 
 ---
 
+## 🚀 Built with human ingenuity & a dash of AI wizardry
 
+This project emerged from late-night coding sessions, unexpected inspiration, and the occasional debugging dance. Every line of code has a story behind it.
 
-# YOLO Presence Detection Processing Server
+Found a bug? Have a wild idea? The issues tab is your canvas.
 
-This is the processing server component for the Home Assistant YOLO Presence Detection integration. It handles video stream processing and object detection using PyTorch and YOLO models.
+Authored By: [👨‍💻 Jurgen Mahn](https://github.com/jurgenmahn) with some help from AI code monkies [Claude](https://claude.ai) & [Manus.im](https://manus.im/app)
 
-## Why a Separate Server?
+*"Sometimes the code writes itself. Other times, we collaborate with the machines."*
 
-The processing server is separated from the Home Assistant integration for several reasons:
-
-1. **Python Version Compatibility**: Home Assistant requires Python 3.13, but some ML libraries like PyTorch and ultralytics don't fully support Python 3.13 yet.
-2. **Dependency Management**: ML libraries have complex dependencies that can conflict with Home Assistant's environment.
-3. **Resource Isolation**: Video processing and ML inference are resource-intensive tasks that can be run on a separate machine with a GPU.
-4. **Scalability**: Multiple Home Assistant instances can connect to a single processing server, or a processing server can handle multiple camera streams.
-
-## Prerequisites
-
-- Docker and Docker Compose
-- NVIDIA GPU (optional, but recommended for better performance)
-  - If using GPU, make sure you have the NVIDIA Container Toolkit installed
-- RTSP or HTTP camera streams
-
-## Getting Started
-
-1. Clone this repository
-2. Place your YOLO models in the `models` directory (if you don't have models, the server will download them from ultralytics)
-3. Start the server with Docker Compose:
-
-```bash
-cd processing_unit
-docker-compose up -d
-```
-
-The server will be available at http://localhost:5505.
-
-## API Endpoints
-
-- `GET /api/status`: Get server status information
-- `GET /api/detectors`: List all detector instances
-- `POST /api/detectors`: Create a new detector instance
-- `GET /api/detectors/{detector_id}`: Get detector status
-- `DELETE /api/detectors/{detector_id}`: Delete a detector
-- `GET /api/detectors/{detector_id}/frame`: Get the latest processed frame (for debugging)
-
-## Usage with Home Assistant
-
-1. Install the YOLO Presence Detection integration in Home Assistant
-2. When adding a new device, set the processing server URL to `http://<your-server-ip>:5505`
-3. Configure the remaining options as needed
-
-## Configuration
-
-The following environment variables can be set in the `docker-compose.yml` file:
-
-- `PORT`: The port to run the server on (default: 5505)
-- `DEBUG`: Enable debug mode (default: false)
-
-## Troubleshooting
-
-- If your computer doesn't have an NVIDIA GPU, remove the `deploy.resources` section from `docker-compose.yml`
-- If you experience memory issues, you can adjust CUDA memory allocation by setting the environment variable `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128` in the docker-compose file
-- Check logs with `docker-compose logs -f`
-
-## Models
-
-The server supports the following YOLO models:
-
-- yolo11n: Fastest, lowest accuracy
-- yolo11s: Fast, good accuracy
-- yolo11m: Balanced speed/accuracy
-- yolo11l: Slower, high accuracy
-- yolo11x: Slowest, highest accuracy
+⚡ Happy hacking, fellow explorer ⚡
