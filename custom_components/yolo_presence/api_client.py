@@ -64,8 +64,8 @@ class YoloProcessingApiClient:
         self._connection_retry_count = 0
         self._max_connection_retries = 0  # 0 means infinite retries - never give up
         self._connection_retry_delay = 5  # seconds
-        self._connection_timeout = 10  # seconds
-        self._heartbeat_interval = 15  # seconds - reduced for more frequent checks
+        self._connection_timeout = 30  # seconds - increased from 10 for more reliability
+        self._heartbeat_interval = 10  # seconds - reduced for more frequent connectivity checks
         self._last_heartbeat_sent = 0
         self._last_heartbeat_received = 0
         self._heartbeat_response_timeout = 30  # seconds - how long to wait for response
@@ -148,16 +148,19 @@ class YoloProcessingApiClient:
                                 and hasattr(socket, "TCP_KEEPCNT")
                             ):
                                 # Time before sending keepalive probes (seconds)
+                                # Reduced from 60 to 30 for faster detection of broken connections
                                 sock.setsockopt(
-                                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30
                                 )
                                 # Time between keepalive probes (seconds)
+                                # Reduced from 10 to 5 for more frequent probing
                                 sock.setsockopt(
-                                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5
                                 )
                                 # Number of keepalive probes before giving up
+                                # Increased from 3 to 5 for more resilience
                                 sock.setsockopt(
-                                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3
+                                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5
                                 )
 
                             _LOGGER.debug("Socket keepalive options configured")
@@ -718,7 +721,9 @@ class YoloProcessingApiClient:
     _MESSAGE_START = b'<<<START>>>'
     _MESSAGE_END = b'<<<END>>>'
     _MESSAGE_BUFFER_SIZE = 4096  # Read buffer size
-    _READ_TIMEOUT = 15  # Longer timeout for overall message reading
+    _READ_TIMEOUT = 30  # Longer timeout for overall message reading
+    _READ_CHUNK_TIMEOUT = 10  # Timeout for individual chunk reads
+    _MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB maximum message size
 
     async def _read_message(self) -> Dict[str, Any]:
         """
@@ -744,11 +749,24 @@ class YoloProcessingApiClient:
             try:
                 # Keep reading until we find the end marker or timeout
                 while True:
-                    # Use a longer overall timeout
-                    chunk = await asyncio.wait_for(
-                        self._reader.read(self._MESSAGE_BUFFER_SIZE), 
-                        timeout=self._READ_TIMEOUT
-                    )
+                    # Use a shorter timeout for individual chunk reads
+                    # to avoid prolonged waits if connection is unstable
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self._reader.read(self._MESSAGE_BUFFER_SIZE), 
+                            timeout=self._READ_CHUNK_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        # Log but don't fail on individual chunk timeouts
+                        # only if we've not started a message yet
+                        if not message_started:
+                            _LOGGER.debug("Timeout waiting for message start marker, continuing...")
+                            # Continue trying to read - we'll hit the overall _READ_TIMEOUT if needed
+                            continue
+                        else:
+                            # If we've started a message, this is a problem
+                            _LOGGER.warning("Timeout waiting for message data after start marker found")
+                            raise ConnectionError("Timeout reading message chunk after start marker")
                     
                     if not chunk:  # Connection closed
                         if message_started:
@@ -776,11 +794,15 @@ class YoloProcessingApiClient:
                             message_data = buffer[:end_pos]
                             _LOGGER.debug("Found message end marker (message size: %d bytes)", len(message_data))
                             break
+                        
+                        # Log progress for large messages to help diagnose issues
+                        if len(buffer) > 10000 and len(buffer) % 10000 == 0:
+                            _LOGGER.debug("Reading large message, current size: %d bytes", len(buffer))
                     
                     # Safety check for buffer size to prevent memory issues
-                    if len(buffer) > 1024 * 1024:  # 1 MB max
-                        _LOGGER.error("Message buffer too large (>1MB)")
-                        raise ConnectionError("Message too large")
+                    if len(buffer) > self._MAX_MESSAGE_SIZE:
+                        _LOGGER.error("Message buffer too large (>%d bytes)", self._MAX_MESSAGE_SIZE)
+                        raise ConnectionError(f"Message too large (exceeded {self._MAX_MESSAGE_SIZE} bytes)")
                 
                 # Parse the message
                 try:
@@ -806,6 +828,13 @@ class YoloProcessingApiClient:
 
                 # Update heartbeat timestamp for any successfully received message
                 self._last_heartbeat_received = time.time()
+                
+                # Reset heartbeat missed count since we got a successful message
+                self._heartbeat_missed_count = 0
+                
+                # Log successful message receipt for diagnostic purposes
+                _LOGGER.debug("Successfully read and parsed message of type '%s' (%d bytes)", 
+                             message_type, len(message_data))
 
                 return message
                 
