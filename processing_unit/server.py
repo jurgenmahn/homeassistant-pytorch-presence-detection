@@ -1247,12 +1247,45 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
     def _send_mjpeg_frame(self, frame, boundary="--boundarydonotcross"):
         """Send a single frame as part of an MJPEG stream."""
         try:
+            # Make sure we have a proper boundary format
+            if not boundary.startswith("--"):
+                boundary = f"--{boundary}"
+
+            # Verify frame is valid
+            if frame is None or frame.size == 0:
+                logger.warning("Attempted to send invalid frame in MJPEG stream")
+                # Create a simple error frame
+                frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                cv2.putText(
+                    frame,
+                    "No valid frame",
+                    (50, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
+                )
+
             # Encode the frame as JPEG
-            _, jpeg_data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # Try with higher quality first
+            try:
+                _, jpeg_data = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error encoding JPEG at high quality: {e}, trying lower quality"
+                )
+                _, jpeg_data = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50]
+                )
+
             jpeg_bytes = jpeg_data.tobytes()
 
-            # Write the MJPEG part header
-            self.wfile.write(f"\r\n{boundary}\r\n".encode())
+            # Write the MJPEG part header with proper boundary format
+            # Note: If this is the first part, we've already written the initial boundary
+            # For subsequent parts, we need the boundary with the leading CRLF
+            self.wfile.write(f"{boundary}\r\n".encode())
             self.wfile.write(b"Content-Type: image/jpeg\r\n")
             self.wfile.write(f"Content-Length: {len(jpeg_bytes)}\r\n\r\n".encode())
 
@@ -1713,16 +1746,24 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                         # Set MJPEG stream headers
                         boundary = "mjpegboundary"
                         self.send_response(200)
+                        # Ensure proper Content-Type for MJPEG stream
                         self.send_header(
                             "Content-Type",
                             f"multipart/x-mixed-replace; boundary={boundary}",
                         )
+                        # Set caching headers to prevent any caching
                         self.send_header(
                             "Cache-Control", "no-cache, no-store, must-revalidate"
                         )
                         self.send_header("Pragma", "no-cache")
                         self.send_header("Expires", "0")
+                        # Add CORS headers to allow embedding in other pages
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Connection", "close")
                         self.end_headers()
+
+                        # Send the initial boundary to properly start the multipart message
+                        self.wfile.write(f"--{boundary}\r\n".encode())
 
                         # Create a placeholder frame with a message if no annotated frame is available
                         def create_placeholder_frame():
@@ -1759,10 +1800,26 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
 
                                     # Add "live" indicator
                                     current_time = time.strftime("%H:%M:%S")
+
+                                    # Calculate safe position for text
+                                    h, w = frame_to_send.shape[:2]
+                                    text_size = cv2.getTextSize(
+                                        f"Live: {current_time}",
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        2,
+                                    )[0]
+
+                                    # Place text in top-right, but ensure it's within frame bounds
+                                    text_x = max(
+                                        10, min(w - text_size[0] - 10, w - 180)
+                                    )
+                                    text_y = 25
+
                                     cv2.putText(
                                         frame_to_send,
                                         f"Live: {current_time}",
-                                        (frame_to_send.shape[1] - 180, 25),
+                                        (text_x, text_y),
                                         cv2.FONT_HERSHEY_SIMPLEX,
                                         0.6,
                                         (0, 255, 255),
@@ -1811,7 +1868,10 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     max-width: 1024px; 
                                     margin: 20px auto; 
                                     border: 2px solid #333; 
-                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1); 
+                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                                    height: auto !important; /* Important - maintain aspect ratio */
+                                    min-height: 240px; /* Ensure image is not too small */
+                                    object-fit: contain; /* Maintain aspect ratio */
                                 }}
                                 .info {{ 
                                     background-color: #fff; 
@@ -1854,7 +1914,28 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                                     <p>Auto-optimization: {"Enabled" if detector.auto_optimization else "Disabled"}</p>
                                 </div>
                                 
-                                <img src="/stream?detector_id={detector_id}" class="stream" alt="Live detection stream" />
+                                <img src="/stream?detector_id={detector_id}" class="stream" alt="Live detection stream" style="width:100%; height:auto; min-height:320px;" />
+                                <script>
+                                    // Check if image loads correctly and refresh if needed
+                                    document.addEventListener('DOMContentLoaded', function() {{
+                                        const streamImg = document.querySelector('.stream');
+                                        streamImg.onerror = function() {{
+                                            console.log('Stream image error, reloading...');
+                                            setTimeout(() => {{
+                                                // Append timestamp to force refresh of image source
+                                                streamImg.src = '/stream?detector_id={detector_id}&t=' + Date.now();
+                                            }}, 2000);
+                                        }};
+                                        
+                                        // Also periodically check if image needs refresh
+                                        setInterval(() => {{
+                                            // If the image height is very small, it might indicate a problem
+                                            if (streamImg.naturalHeight < 10) {{
+                                                console.log('Stream image too small, refreshing...');
+                                                streamImg.src = '/stream?detector_id={detector_id}&t=' + Date.now();
+                                            }}
+                                        }}, 5000);
+                                    }});
                                 
                                 <p>
                                     <button class="refresh" onclick="window.location.reload()">Refresh Page</button>
