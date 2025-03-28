@@ -276,8 +276,6 @@ class YoloDetector:
                     if ":" in userpass:
                         user, _ = userpass.split(":", 1)
                         masked_netloc = f"{user}:****@{hostport}"
-                    else:
-                        masked_netloc = f"{userpass}@{hostport}"
 
                     masked_url = (
                         f"{parsed_url.scheme}://{masked_netloc}{parsed_url.path}"
@@ -307,7 +305,7 @@ class YoloDetector:
             # Create a new stream processor with appropriate settings
             self.stream_processor = RTSPStreamProcessor(
                 rtsp_url=url_to_use,
-                process_nth_frame=15 * 5,
+                process_nth_frame=self.frame_skip_rate,
                 reconnect_delay=self.stream_reconnect_delay,
             )
 
@@ -354,6 +352,7 @@ class YoloDetector:
                 logger.warning(
                     f"No frame available for detection from {self.detector_id}"
                 )
+                return False
 
             # Log that we received a frame for processing
             logger.debug(f"Got frame for detection processing: {frame.shape}")
@@ -531,40 +530,75 @@ class YoloDetector:
             # Store the adjusted dimensions that were actually used
             self.adjusted_dimensions = (adjusted_width, adjusted_height)
 
+            # Add semi-transparent background and text overlay for annotations
+            overlay = annotated_frame.copy()
+            
+            # Create function to add text with background
+            def add_text_with_background(image, text, position, font, font_scale, text_color, text_thickness):
+                # Get text size
+                text_size, _ = cv2.getTextSize(text, font, font_scale, text_thickness)
+                text_w, text_h = text_size
+                x, y = position
+                
+                # Draw background rectangle (slightly larger than text)
+                padding = 5
+                cv2.rectangle(
+                    image,
+                    (x - padding, y - text_h - padding),
+                    (x + text_w + padding, y + padding),
+                    (0, 0, 0),
+                    -1
+                )
+                
+                # Draw text
+                cv2.putText(
+                    image,
+                    text,
+                    position,
+                    font,
+                    font_scale,
+                    text_color,
+                    text_thickness
+                )
+            
             # Add timestamp and extra info to the annotated frame
             current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(
-                annotated_frame,
+            add_text_with_background(
+                overlay,
                 f"Time: {current_time}",
                 (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 255, 0),
-                2,
+                2
             )
 
             # Add detection stats
             info_text = f"People: {people_count}, Pets: {pet_count}"
-            cv2.putText(
-                annotated_frame,
+            add_text_with_background(
+                overlay,
                 info_text,
-                (10, 55),
+                (10, 55), 
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 255, 0),
-                2,
+                2
             )
 
             # Add inference time
-            cv2.putText(
-                annotated_frame,
+            add_text_with_background(
+                overlay,
                 f"Inference: {inference_time:.1f}ms",
                 (10, 85),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 255, 0),
-                2,
+                2
             )
+            
+            # Add semi-transparent overlay to the original frame
+            alpha = 0.7  # Transparency factor
+            cv2.addWeighted(overlay, alpha, annotated_frame, 1 - alpha, 0, annotated_frame)
 
             # Store the annotated frame for visualization endpoint
             self.last_annotated_frame = annotated_frame
@@ -644,10 +678,7 @@ class YoloDetector:
         # Signal thread to stop
         self.stop_event.set()
 
-        # Wait for thread to exit
-        if self.detection_thread and self.detection_thread.is_alive():
-            logger.info(f"Waiting for detection thread to exit for {self.detector_id}")
-            self.detection_thread.join(timeout=5)
+        # No need to wait for detection_thread as it's been replaced by RTSPStreamProcessor
 
         # Force cleanup
         self._cleanup()
@@ -973,6 +1004,80 @@ def check_disk_space() -> float:
         return 0.0
 
 
+def load_template(template_name: str) -> str:
+    """Load a template file from the templates directory.
+    
+    Args:
+        template_name: Name of the template file without path.
+        
+    Returns:
+        The template content as a string.
+    """
+    try:
+        template_path = os.path.join(os.path.dirname(__file__), "templates", template_name)
+        with open(template_path, 'r') as f:
+            return f.read()
+    except Exception as ex:
+        logger.error(f"Error loading template {template_name}: {ex}")
+        return f"<h1>Error loading template {template_name}</h1><p>{str(ex)}</p>"
+
+
+def render_template(template_name: str, context: Dict[str, Any]) -> str:
+    """Render a template with the given context.
+    
+    Args:
+        template_name: Name of the template file without path.
+        context: Dictionary of values to replace in the template.
+        
+    Returns:
+        The rendered template as a string.
+    """
+    template = load_template(template_name)
+    
+    # Handle simple variable replacements
+    for key, value in context.items():
+        placeholder = f"{{{{{key}}}}}"
+        template = template.replace(placeholder, str(value))
+    
+    # Handle conditional blocks (#if, #each)
+    # #if block processing
+    for match in ["{{#if no_detectors}}", "{{#if no_detectors}}\n"]:
+        if match in template:
+            parts = template.split(match)
+            if len(parts) > 1:
+                before = parts[0]
+                after_parts = parts[1].split("{{else}}")
+                if len(after_parts) > 1:
+                    if_content = after_parts[0]
+                    else_content = after_parts[1].split("{{/if}}")[0]
+                    remaining = parts[1].split("{{/if}}")[1]
+                    
+                    if context.get("no_detectors", False):
+                        template = before + if_content + remaining
+                    else:
+                        template = before + else_content + remaining
+    
+    # #each block processing
+    if "{{#each detectors}}" in template:
+        parts = template.split("{{#each detectors}}")
+        if len(parts) > 1:
+            before = parts[0]
+            each_content = parts[1].split("{{/each}}")[0]
+            after = parts[1].split("{{/each}}")[1]
+            
+            items_html = ""
+            for item in context.get("detectors", []):
+                item_html = each_content
+                for key, value in item.items():
+                    placeholder = f"{{{{{key}}}}}"
+                    item_html = item_html.replace(placeholder, str(value))
+                items_html += item_html
+                
+            template = before + items_html + after
+    
+    return template
+
+
 class YoloHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for YOLO detectors."""
 
@@ -1030,65 +1135,6 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
             return username == AUTH_USERNAME and password == AUTH_PASSWORD
         except Exception as ex:
             logger.warning(f"Authentication error: {ex}")
-            return False
-
-    # Removed _send_auth_required method as requested
-
-    def _send_mjpeg_frame(self, frame, boundary="--boundarydonotcross"):
-        """Send a single frame as part of an MJPEG stream."""
-        try:
-            # Make sure we have a proper boundary format
-            if not boundary.startswith("--"):
-                boundary = f"--{boundary}"
-
-            # Verify frame is valid
-            if frame is None or frame.size == 0:
-                logger.warning("Attempted to send invalid frame in MJPEG stream")
-                # Create a simple error frame
-                frame = np.zeros((240, 320, 3), dtype=np.uint8)
-                cv2.putText(
-                    frame,
-                    "No valid frame",
-                    (50, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2,
-                )
-
-            # Encode the frame as JPEG
-            # Try with higher quality first
-            try:
-                _, jpeg_data = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Error encoding JPEG at high quality: {e}, trying lower quality"
-                )
-                _, jpeg_data = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50]
-                )
-
-            jpeg_bytes = jpeg_data.tobytes()
-
-            # Write the MJPEG part header with proper boundary format
-            # Note: If this is the first part, we've already written the initial boundary
-            # For subsequent parts, we need the boundary with the leading CRLF
-            self.wfile.write(f"{boundary}\r\n".encode())
-            self.wfile.write(b"Content-Type: image/jpeg\r\n")
-            self.wfile.write(f"Content-Length: {len(jpeg_bytes)}\r\n\r\n".encode())
-
-            # Write the JPEG data
-            self.wfile.write(jpeg_bytes)
-            self.wfile.flush()
-
-            return True
-        except (ConnectionResetError, BrokenPipeError) as e:
-            logger.warning(f"Client disconnected during MJPEG streaming: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Error sending MJPEG frame: {e}")
             return False
 
     def _send_response(self, data: Dict[str, Any], status_code: int = 200) -> None:
@@ -1283,168 +1329,46 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                 # Root endpoint - show HTML index page with list of detectors
                 try:
                     with detector_lock:
-                        # Create a simple HTML page that lists all detectors with links to their view pages
-                        html = (
-                            """
-                        <!DOCTYPE html>
-                        <html>
-                        <head>
-                            <title>YOLO Presence Detection Server</title>
-                            <style>
-                                body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f0f0; }
-                                h1 { color: #333; }
-                                .container { max-width: 1200px; margin: 0 auto; }
-                                .detector-list { list-style: none; padding: 0; }
-                                .detector-card { 
-                                    background-color: #fff; 
-                                    border-radius: 5px; 
-                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                                    margin-bottom: 15px; 
-                                    padding: 15px; 
-                                    display: flex;
-                                    justify-content: space-between;
-                                    align-items: center;
-                                }
-                                .detector-info { flex-grow: 1; }
-                                .detector-name { font-weight: bold; font-size: 18px; margin-bottom: 5px; }
-                                .detector-id { color: #666; font-size: 14px; margin-bottom: 5px; }
-                                .detector-model { color: #444; margin-bottom: 5px; }
-                                .detector-resolution { color: #444; margin-bottom: 5px; }
-                                .detector-stats { color: #444; }
-                                .status { 
-                                    display: inline-block;
-                                    padding: 5px 10px; 
-                                    border-radius: 3px; 
-                                    font-weight: bold; 
-                                    margin-bottom: 10px;
-                                }
-                                .connected { background-color: #d4edda; color: #155724; }
-                                .disconnected { background-color: #f8d7da; color: #721c24; }
-                                .reconnecting { background-color: #fff3cd; color: #856404; }
-                                .error { background-color: #f8d7da; color: #721c24; }
-                                .detector-actions { 
-                                    display: flex;
-                                    gap: 10px;
-                                }
-                                .view-button { 
-                                    display: inline-block;
-                                    padding: 8px 15px; 
-                                    background-color: #007bff; 
-                                    color: white; 
-                                    text-decoration: none; 
-                                    border-radius: 3px; 
-                                    font-weight: bold;
-                                }
-                                .view-button:hover { background-color: #0069d9; }
-                                .no-detectors {
-                                    background-color: #fff;
-                                    padding: 20px;
-                                    border-radius: 5px;
-                                    text-align: center;
-                                    color: #666;
-                                }
-                                .server-info {
-                                    background-color: #fff;
-                                    padding: 15px;
-                                    border-radius: 5px;
-                                    margin-bottom: 20px;
-                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                                }
-                                .server-info h2 {
-                                    margin-top: 0;
-                                    color: #333;
-                                }
-                                .refresh {
-                                    padding: 10px 15px;
-                                    background-color: #6c757d;
-                                    color: white;
-                                    border: none;
-                                    border-radius: 3px;
-                                    cursor: pointer;
-                                    font-size: 16px;
-                                    margin: 10px 0;
-                                }
-                                .refresh:hover {
-                                    background-color: #5a6268;
-                                }
-                            </style>
-                            <meta http-equiv="refresh" content="30">
-                        </head>
-                        <body>
-                            <div class="container">
-                                <h1>YOLO Presence Detection Server</h1>
-                                
-                                <div class="server-info">
-                                    <h2>Server Status</h2>
-                                    <p>Active detectors: """
-                            + str(len(detectors))
-                            + """</p>
-                                    <p>Server time: """
-                            + time.strftime("%Y-%m-%d %H:%M:%S")
-                            + """</p>
-                                    <button class="refresh" onclick="window.location.reload()">Refresh Now</button>
-                                    <p><small>Page auto-refreshes every 30 seconds</small></p>
-                                </div>
-                                
-                                <h2>Detectors</h2>
-                        """
-                        )
-
-                        if not detectors:
-                            html += """
-                                <div class="no-detectors">
-                                    <p>No active detectors found.</p>
-                                    <p>When a detector connects, it will appear here.</p>
-                                </div>
-                            """
-                        else:
-                            html += '<ul class="detector-list">'
-
-                            for detector_id, detector in detectors.items():
+                        # Prepare data for index template
+                        context = {
+                            "detector_count": str(len(detectors)),
+                            "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "no_detectors": len(detectors) == 0
+                        }
+                        
+                        if detectors:
+                            # Create a list of detector data for the template
+                            detector_list = []
+                            for d_id, detector in detectors.items():
                                 state = detector.get_state()
-
+                                
                                 # Format detection information
                                 detection_info = ""
-                                if (
-                                    hasattr(detector, "detected_objects")
-                                    and detector.detected_objects
-                                ):
+                                if hasattr(detector, "detected_objects") and detector.detected_objects:
                                     items = [
                                         f"{count} {obj}"
                                         for obj, count in detector.detected_objects.items()
                                     ]
                                     if items:
                                         detection_info = f"Detected: {', '.join(items)}"
-
-                                html += f"""
-                                    <li class="detector-card">
-                                        <div class="detector-info">
-                                            <div class="detector-name">{detector.name}</div>
-                                            <div class="detector-id">ID: {detector_id}</div>
-                                            <div class="status {detector.connection_status}">{detector.connection_status.upper()}</div>
-                                            <div class="detector-model">Model: {detector.model_name}</div>
-                                            <div class="detector-resolution">Resolution: {detector.input_width}x{detector.input_height}</div>
-                                            <div class="detector-stats">
-                                                People: {detector.people_count}, 
-                                                Pets: {detector.pet_count}
-                                            </div>
-                                            <div class="detector-stats">
-                                                {detection_info}
-                                            </div>
-                                        </div>
-                                        <div class="detector-actions">
-                                            <a class="view-button" href="/view?detector_id={detector_id}">View Stream</a>
-                                        </div>
-                                    </li>
-                                """
-
-                            html += "</ul>"
-
-                        html += """
-                            </div>
-                        </body>
-                        </html>
-                        """
+                                
+                                detector_list.append({
+                                    "detector_id": d_id,
+                                    "name": detector.name,
+                                    "connection_status": detector.connection_status,
+                                    "connection_status_upper": detector.connection_status.upper(),
+                                    "model_name": detector.model_name,
+                                    "input_width": detector.input_width,
+                                    "input_height": detector.input_height,
+                                    "people_count": detector.people_count,
+                                    "pet_count": detector.pet_count,
+                                    "detection_info": detection_info
+                                })
+                            
+                            context["detectors"] = detector_list
+                        
+                        # Render the template
+                        html = render_template("index.html", context)
 
                         # Send the HTML response
                         self.send_response(200)
@@ -1580,157 +1504,20 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             return
 
                         detector = detectors[detector_id]
-
-                        # Create a simple HTML page with JPEG that refreshes with timer
-                        html = f"""
-                        <!DOCTYPE html>
-                        <html>
-                        <head>
-                            <title>YOLO Detector: {detector.name}</title>
-                            <style>
-                                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; text-align: center; background-color: #f0f0f0; }}
-                                h1 {{ color: #333; }}
-                                .container {{ max-width: 1200px; margin: 0 auto; }}
-                                .info {{ 
-                                    background-color: #fff; 
-                                    padding: 15px; 
-                                    border-radius: 5px; 
-                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                                    margin: 20px auto;
-                                    max-width: 1024px;
-                                    text-align: left;
-                                }}
-                                .detector-name {{ font-weight: bold; font-size: 18px; }}
-                                .status {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; }}
-                                .connected {{ background-color: #d4edda; color: #155724; }}
-                                .disconnected {{ background-color: #f8d7da; color: #721c24; }}
-                                .reconnecting {{ background-color: #fff3cd; color: #856404; }}
-                                .error {{ background-color: #f8d7da; color: #721c24; }}
-                                .refresh-btn {{ 
-                                    padding: 10px 15px; 
-                                    background-color: #007bff; 
-                                    color: white; 
-                                    border: none; 
-                                    border-radius: 3px; 
-                                    cursor: pointer; 
-                                    font-size: 16px;
-                                }}
-                                .refresh-btn:hover {{ background-color: #0069d9; }}
-                                #image-container {{
-                                    width: 100%;
-                                    max-width: 1024px;
-                                    margin: 20px auto;
-                                    border: 2px solid #333;
-                                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                                    background-color: #000;
-                                    position: relative;
-                                    min-height: 480px;
-                                }}
-                                #detector-image {{
-                                    width: 100%;
-                                    height: auto;
-                                    min-height: 480px;
-                                    display: block;
-                                    object-fit: contain;
-                                }}
-                            </style>
-                        </head>
-                        <body>
-                            <div class="container">
-                                <h1>YOLO Detector Live Stream</h1>
-                                
-                                <div class="info">
-                                    <p class="detector-name">Name: {detector.name}</p>
-                                    <p>Detector ID: {detector.detector_id}</p>
-                                    <p>Model: {detector.model_name}</p>
-                                    <p>Status: <span class="status {detector.connection_status}">{detector.connection_status}</span></p>
-                                    <p>Resolution: {detector.input_width}x{detector.input_height}</p>
-                                    <p>Confidence threshold: {detector.confidence_threshold}</p>
-                                </div>
-                                
-                                <div id="image-container">
-                                    <img id="detector-image" src="/jpeg?detector_id={detector_id}" alt="Live detection stream" />
-                                </div>
-                                
-                                <div id="status-info" style="margin:10px auto; padding:8px; background-color:#f0f0f0; border-radius:4px; max-width:1024px; text-align:center; font-weight:bold;">
-                                    Starting...
-                                </div>
-                                
-                                <div style="margin:10px auto; max-width:1024px;">
-                                    <button id="play-pause-btn" class="refresh-btn" style="margin-right:10px;">Pause</button>
-                                    <button class="refresh-btn" onclick="window.location.reload()">Refresh Page</button>
-                                </div>
-                                
-                                <script>
-                                    // Simple timer-based image refresh
-                                    document.addEventListener('DOMContentLoaded', function() {{
-                                        const img = document.getElementById('detector-image');
-                                        const statusDiv = document.getElementById('status-info');
-                                        const playPauseBtn = document.getElementById('play-pause-btn');
-                                        let frameCount = 0;
-                                        let refreshInterval = 200; // milliseconds (5 FPS)
-                                        let refreshTimer = null;
-                                        let isPaused = false;
-                                        
-                                        // Function to update the image
-                                        function updateImage() {{
-                                            // Update the image with a timestamp to prevent caching
-                                            img.src = `/jpeg?detector_id={detector_id}&t=${{Date.now()}}`;
-                                            frameCount++;
-                                            statusDiv.textContent = `Frame count: ${{frameCount}}`;
-                                        }}
-                                        
-                                        // Start the refresh timer
-                                        function startRefresh() {{
-                                            if (!refreshTimer) {{
-                                                refreshTimer = setInterval(updateImage, refreshInterval);
-                                                statusDiv.textContent = "Streaming...";
-                                            }}
-                                        }}
-                                        
-                                        // Stop the refresh timer
-                                        function stopRefresh() {{
-                                            if (refreshTimer) {{
-                                                clearInterval(refreshTimer);
-                                                refreshTimer = null;
-                                                statusDiv.textContent = "Paused";
-                                            }}
-                                        }}
-                                        
-                                        // Toggle play/pause when button is clicked
-                                        playPauseBtn.addEventListener('click', function() {{
-                                            isPaused = !isPaused;
-                                            if (isPaused) {{
-                                                stopRefresh();
-                                                playPauseBtn.textContent = 'Resume';
-                                            }} else {{
-                                                startRefresh();
-                                                playPauseBtn.textContent = 'Pause';
-                                            }}
-                                        }});
-                                        
-                                        // Start refreshing immediately
-                                        startRefresh();
-                                        
-                                        // Detect when image loads successfully
-                                        img.onload = function() {{
-                                            // Success - do nothing
-                                        }};
-                                        
-                                        // Detect errors loading the image
-                                        img.onerror = function() {{
-                                            statusDiv.textContent = "Error loading image, retrying...";
-                                        }};
-                                    
-                                    // Auto-refresh the whole page every 5 minutes to prevent memory issues
-                                    setTimeout(function() {{
-                                        window.location.reload();
-                                    }}, 5 * 60 * 1000);
-                                </script>
-                            </div>
-                        </body>
-                        </html>
-                        """
+                        
+                        # Prepare context for the view template
+                        context = {
+                            "detector_id": detector_id,
+                            "detector_name": detector.name,
+                            "model_name": detector.model_name,
+                            "connection_status": detector.connection_status,
+                            "input_width": detector.input_width,
+                            "input_height": detector.input_height,
+                            "confidence_threshold": detector.confidence_threshold
+                        }
+                        
+                        # Render the template
+                        html = render_template("view.html", context)
 
                         # Send the HTML response
                         self.send_response(200)

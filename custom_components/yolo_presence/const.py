@@ -14,6 +14,7 @@ CONF_PROCESSING_SERVER = "processing_server"
 CONF_PROCESSING_SERVER_PORT = "processing_server_port"
 CONF_USE_TCP_CONNECTION = "use_tcp_connection"
 CONF_USE_AUTO_OPTIMIZATION = "use_auto_optimization"  # New option for automatic optimization
+CONF_FRAME_SKIP_RATE = "frame_skip_rate"  # Control how many frames to skip between processing
 
 # Entity attributes
 ATTR_DEVICE_ID = "device_id"

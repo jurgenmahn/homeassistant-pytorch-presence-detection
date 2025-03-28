@@ -7,10 +7,20 @@ import cv2
 import time
 import logging
 import threading
+import numpy as np
 from datetime import datetime
 
-# We'll use the logger from the main application
-logger = logging.getLogger("yolo_server.rtsp_processor")
+# Import and configure logging
+from logging_config import configure_logging
+
+# Set up logging with DEBUG level for console output
+logger = configure_logging(
+    logger_name="yolo_server.rtsp_processor",
+    log_level=logging.DEBUG,  # Set overall log level to DEBUG
+    console_level=logging.DEBUG,  # Set console level to DEBUG
+    file_level=logging.DEBUG,
+    detailed_format=True,
+)
 
 class RTSPStreamProcessor:
     def __init__(self, rtsp_url, process_nth_frame=30, reconnect_delay=5):
@@ -33,6 +43,7 @@ class RTSPStreamProcessor:
         self.max_reconnect_attempts = 0  # 0 = unlimited reconnection attempts
         self.capture = None
         self.process_thread = None
+        self.last_frame_lock = threading.Lock()
         
     def _create_capture(self):
         """Create OpenCV VideoCapture with CUDA hardware acceleration"""
@@ -81,10 +92,14 @@ class RTSPStreamProcessor:
         """Process frames from the stream"""
         consecutive_failures = 0
         max_consecutive_failures = 10  # Maximum failures before reconnection
-        
+        fps = self.capture.get(cv2.CAP_PROP_FPS)
+        logger.info(f"Stream FPS: {fps}")
+        logger.info(f"Process every Nth frame: {self.process_nth_frame}")
         logger.info("Stream processing started")
-        
+
         while not self.stop_event.is_set():
+            frame_start_time = time.time()
+            
             if self.capture is None or not self.capture.isOpened():
                 logger.warning("Capture is not valid, attempting to reconnect")
                 self._reconnect()
@@ -93,7 +108,7 @@ class RTSPStreamProcessor:
             try:
                 # Read a frame from the capture
                 ret, frame = self.capture.read()
-                
+                    
                 if not ret:
                     consecutive_failures += 1
                     logger.warning(f"Failed to read frame: attempt {consecutive_failures}/{max_consecutive_failures}")
@@ -105,27 +120,24 @@ class RTSPStreamProcessor:
                     else:
                         # Short sleep before next attempt
                         time.sleep(0.1)
-                    continue
-                
+                    continue                    
+                    
+                # save the last frame   
+                self.set_latest_frame(frame)
+
                 # Reset failures counter on successful frame read
                 consecutive_failures = 0
-                
-                # Increment frame counter
-                self.frame_count += 1
-                
-                # Store current frame
-                self.last_frame = frame.copy()
-                
-                # Process only every Nth frame for efficiency
-                if self.frame_count % self.process_nth_frame == 0:
-                    self._process_frame(frame)
                     
-                # Release this frame to free memory
-                # frame = None
+                # spare the CPU
+                process_time = time.time() - frame_start_time
                 
-                # Sleep a tiny amount to prevent CPU overload
-                time.sleep(0.001)
+                # since we keep only last frame in buffer, just sleep so we skip x frames
+                sleep_time = ((1/fps) * self.process_nth_frame) - process_time
+                time.sleep(sleep_time)
                 
+                # count frames
+                self.frame_count += 1
+
             except Exception as e:
                 logger.error(f"Error processing stream: {e}")
                 consecutive_failures += 1
@@ -133,20 +145,9 @@ class RTSPStreamProcessor:
                 if consecutive_failures >= max_consecutive_failures:
                     logger.error("Too many consecutive failures, reconnecting")
                     self._reconnect()
-                    consecutive_failures = 0
+                    consecutive_failures = 0                
                     
         logger.info("Stream processing stopped")
-                
-    def _process_frame(self, frame):
-        """
-        Process frame - in our case, we just store it
-        This method is intentionally minimal, as requested
-        """
-        # We don't need to do any processing here - just store the frame
-        # The main YoloDetector class will handle the actual processing
-        
-        # Just log that we received a frame at debug level
-        logger.debug(f"Received frame {self.frame_count}")
         
     def _reconnect(self):
         """Attempt to reconnect to the RTSP stream after a delay"""
@@ -232,10 +233,15 @@ class RTSPStreamProcessor:
     def is_running(self):
         """Check if the stream processor is running"""
         return self.running
-        
+    
     def get_latest_frame(self):
         """Get the latest processed frame"""
-        return self.last_frame
-
-
-# No example usage when imported as a module
+        with self.last_frame_lock:
+            # Create a copy to prevent the frame from being modified while using it
+            if self.last_frame is not None:
+                return self.last_frame.copy()
+            return None   
+        
+    def set_latest_frame(self, frame):
+        with self.last_frame_lock:
+            self.last_frame = frame

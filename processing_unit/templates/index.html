@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO Presence Detection Server</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f0f0; }
+        h1 { color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .detector-list { list-style: none; padding: 0; }
+        .detector-card { 
+            background-color: #fff; 
+            border-radius: 5px; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 15px; 
+            padding: 15px; 
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .detector-info { flex-grow: 1; }
+        .detector-name { font-weight: bold; font-size: 18px; margin-bottom: 5px; }
+        .detector-id { color: #666; font-size: 14px; margin-bottom: 5px; }
+        .detector-model { color: #444; margin-bottom: 5px; }
+        .detector-resolution { color: #444; margin-bottom: 5px; }
+        .detector-stats { color: #444; }
+        .status { 
+            display: inline-block;
+            padding: 5px 10px; 
+            border-radius: 3px; 
+            font-weight: bold; 
+            margin-bottom: 10px;
+        }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .reconnecting { background-color: #fff3cd; color: #856404; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .detector-actions { 
+            display: flex;
+            gap: 10px;
+        }
+        .view-button { 
+            display: inline-block;
+            padding: 8px 15px; 
+            background-color: #007bff; 
+            color: white; 
+            text-decoration: none; 
+            border-radius: 3px; 
+            font-weight: bold;
+        }
+        .view-button:hover { background-color: #0069d9; }
+        .no-detectors {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            text-align: center;
+            color: #666;
+        }
+        .server-info {
+            background-color: #fff;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .server-info h2 {
+            margin-top: 0;
+            color: #333;
+        }
+        .refresh {
+            padding: 10px 15px;
+            background-color: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 0;
+        }
+        .refresh:hover {
+            background-color: #5a6268;
+        }
+    </style>
+    <meta http-equiv="refresh" content="30">
+</head>
+<body>
+    <div class="container">
+        <h1>YOLO Presence Detection Server</h1>
+        
+        <div class="server-info">
+            <h2>Server Status</h2>
+            <p>Active detectors: {{detector_count}}</p>
+            <p>Server time: {{server_time}}</p>
+            <button class="refresh" onclick="window.location.reload()">Refresh Now</button>
+            <p><small>Page auto-refreshes every 30 seconds</small></p>
+        </div>
+        
+        <h2>Detectors</h2>
+        
+        {{#if no_detectors}}
+        <div class="no-detectors">
+            <p>No active detectors found.</p>
+            <p>When a detector connects, it will appear here.</p>
+        </div>
+        {{else}}
+        <ul class="detector-list">
+            {{#each detectors}}
+            <li class="detector-card">
+                <div class="detector-info">
+                    <div class="detector-name">{{name}}</div>
+                    <div class="detector-id">ID: {{detector_id}}</div>
+                    <div class="status {{connection_status}}">{{connection_status_upper}}</div>
+                    <div class="detector-model">Model: {{model_name}}</div>
+                    <div class="detector-resolution">Resolution: {{input_width}}x{{input_height}}</div>
+                    <div class="detector-stats">
+                        People: {{people_count}}, 
+                        Pets: {{pet_count}}
+                    </div>
+                    <div class="detector-stats">
+                        {{detection_info}}
+                    </div>
+                </div>
+                <div class="detector-actions">
+                    <a class="view-button" href="/view?detector_id={{detector_id}}">View Stream</a>
+                </div>
+            </li>
+            {{/each}}
+        </ul>
+        {{/if}}
+    </div>
+</body>
+</html>

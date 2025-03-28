@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO Detector: {{detector_name}}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; text-align: center; background-color: #f0f0f0; }
+        h1 { color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .info { 
+            background-color: #fff; 
+            padding: 15px; 
+            border-radius: 5px; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px auto;
+            max-width: 1024px;
+            text-align: left;
+        }
+        .detector-name { font-weight: bold; font-size: 18px; }
+        .status { padding: 5px 10px; border-radius: 3px; font-weight: bold; }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .reconnecting { background-color: #fff3cd; color: #856404; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .refresh-btn { 
+            padding: 10px 15px; 
+            background-color: #007bff; 
+            color: white; 
+            border: none; 
+            border-radius: 3px; 
+            cursor: pointer; 
+            font-size: 16px;
+        }
+        .refresh-btn:hover { background-color: #0069d9; }
+        #image-container {
+            width: 100%;
+            max-width: 1024px;
+            margin: 20px auto;
+            border: 2px solid #333;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            background-color: #000;
+            position: relative;
+            min-height: 480px;
+        }
+        #detector-image {
+            width: 100%;
+            height: auto;
+            min-height: 480px;
+            display: block;
+            object-fit: contain;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>YOLO Detector Live Stream</h1>
+        
+        <div class="info">
+            <p class="detector-name">Name: {{detector_name}}</p>
+            <p>Detector ID: {{detector_id}}</p>
+            <p>Model: {{model_name}}</p>
+            <p>Status: <span class="status {{connection_status}}">{{connection_status}}</span></p>
+            <p>Resolution: {{input_width}}x{{input_height}}</p>
+            <p>Confidence threshold: {{confidence_threshold}}</p>
+        </div>
+        
+        <div id="image-container">
+            <img id="detector-image" src="/jpeg?detector_id={{detector_id}}" alt="Live detection stream" />
+        </div>
+        
+        <div id="status-info" style="margin:10px auto; padding:8px; background-color:#f0f0f0; border-radius:4px; max-width:1024px; text-align:center; font-weight:bold;">
+            Starting...
+        </div>
+        
+        <div style="margin:10px auto; max-width:1024px;">
+            <button id="play-pause-btn" class="refresh-btn" style="margin-right:10px;">Pause</button>
+            <button class="refresh-btn" onclick="window.location.reload()">Refresh Page</button>
+        </div>
+        
+        <script>
+            // Simple timer-based image refresh
+            document.addEventListener('DOMContentLoaded', function() {
+                const img = document.getElementById('detector-image');
+                const statusDiv = document.getElementById('status-info');
+                const playPauseBtn = document.getElementById('play-pause-btn');
+                let frameCount = 0;
+                let refreshInterval = 5000; // milliseconds (5 FPS)
+                let refreshTimer = null;
+                let isPaused = false;
+                
+                // Function to update the image
+                function updateImage() {
+                    // Update the image with a timestamp to prevent caching
+                    img.src = `/jpeg?detector_id={{detector_id}}&t=${Date.now()}`;
+                    frameCount++;
+                    statusDiv.textContent = `Frame count: ${frameCount}`;
+                }
+                
+                // Start the refresh timer
+                function startRefresh() {
+                    if (!refreshTimer) {
+                        refreshTimer = setInterval(updateImage, refreshInterval);
+                        statusDiv.textContent = "Streaming...";
+                    }
+                }
+                
+                // Stop the refresh timer
+                function stopRefresh() {
+                    if (refreshTimer) {
+                        clearInterval(refreshTimer);
+                        refreshTimer = null;
+                        statusDiv.textContent = "Paused";
+                    }
+                }
+                
+                // Toggle play/pause when button is clicked
+                playPauseBtn.addEventListener('click', function() {
+                    isPaused = !isPaused;
+                    if (isPaused) {
+                        stopRefresh();
+                        playPauseBtn.textContent = 'Resume';
+                    } else {
+                        startRefresh();
+                        playPauseBtn.textContent = 'Pause';
+                    }
+                });
+                
+                // Start refreshing immediately
+                startRefresh();
+                
+                // Detect when image loads successfully
+                img.onload = function() {
+                    // Success - do nothing
+                };
+                
+                // Detect errors loading the image
+                img.onerror = function() {
+                    statusDiv.textContent = "Error loading image, retrying...";
+                };
+            
+                // Auto-refresh the whole page every 5 minutes to prevent memory issues
+                setTimeout(function() {
+                    window.location.reload();
+                }, 5 * 60 * 1000);
+            });
+        </script>
+    </div>
+</body>
+</html>

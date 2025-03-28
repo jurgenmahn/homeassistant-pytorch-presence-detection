@@ -18,11 +18,13 @@ from .const import (
     CONF_PROCESSING_SERVER_PORT,
     CONF_USE_TCP_CONNECTION,
     CONF_USE_AUTO_OPTIMIZATION,
+    CONF_FRAME_SKIP_RATE,
     DEFAULT_NAME,
     DEFAULT_DETECTION_INTERVAL_CPU,
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_INPUT_SIZE,
     DEFAULT_MODEL,
+    DEFAULT_FRAME_SKIP_RATE_CPU,
     DEFAULT_PROCESSING_SERVER,
     DEFAULT_PROCESSING_SERVER_PORT,
     DEFAULT_USE_TCP_CONNECTION,
@@ -151,6 +153,9 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_INPUT_SIZE, default=DEFAULT_INPUT_SIZE): vol.In(
                         INPUT_SIZE_OPTIONS
                     ),
+                    vol.Required(
+                        CONF_FRAME_SKIP_RATE, default=DEFAULT_FRAME_SKIP_RATE_CPU
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
                 }
             )
         else:
@@ -177,6 +182,11 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         default=DEFAULT_INPUT_SIZE,
                         description={"disabled": True},
                     ): vol.In(INPUT_SIZE_OPTIONS),
+                    vol.Required(
+                        CONF_FRAME_SKIP_RATE,
+                        default=DEFAULT_FRAME_SKIP_RATE_CPU,
+                        description={"disabled": True},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
                 }
             )
 
@@ -304,6 +314,12 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                             CONF_INPUT_SIZE, DEFAULT_INPUT_SIZE
                         ),
                     ): vol.In(INPUT_SIZE_OPTIONS),
+                    vol.Required(
+                        CONF_FRAME_SKIP_RATE,
+                        default=current_settings.get(
+                            CONF_FRAME_SKIP_RATE, DEFAULT_FRAME_SKIP_RATE_CPU
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
                 }
             )
         else:
@@ -331,6 +347,11 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                         default=DEFAULT_INPUT_SIZE,
                         description={"disabled": True},
                     ): vol.In(INPUT_SIZE_OPTIONS),
+                    vol.Required(
+                        CONF_FRAME_SKIP_RATE,
+                        default=DEFAULT_FRAME_SKIP_RATE_CPU,
+                        description={"disabled": True},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
                 }
             )
 
