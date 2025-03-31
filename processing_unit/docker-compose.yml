@@ -14,10 +14,6 @@ services:
     environment:
       - HTTP_PORT=5505
       - DEBUG=false
-      # Web interface authentication (optional)
-      - ENABLE_AUTH=false      # Set to true to enable authentication
-      - AUTH_USERNAME=admin    # Change this username
-      - AUTH_PASSWORD=yolopassword  # Change this password
     deploy:
       resources:
         reservations:
