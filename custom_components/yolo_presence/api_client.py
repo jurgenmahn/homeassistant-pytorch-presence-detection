@@ -67,12 +67,17 @@ class YoloProcessingApiClient:
         self._available = False
         self._last_error = None
         self._session = None
+        self._closed = False  # Flag to track if the client has been closed
 
         # Callback management
         self._update_callbacks: List[Callable[[], None]] = []
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create a client session."""
+        if self._closed:
+            _LOGGER.warning("Attempting to get session on closed client")
+            raise RuntimeError("Client is closed")
+            
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -107,6 +112,8 @@ class YoloProcessingApiClient:
                     "confidence_threshold",
                     "frame_skip_rate",
                     "use_auto_optimization",  # Add auto_optimization flag
+                    "detection_frame_count",
+                    "consistent_detection_count",
                 ]:
                     if key in config:
                         poll_data["config"][key] = config[key]
@@ -239,32 +246,36 @@ class YoloProcessingApiClient:
 
     async def async_shutdown(self) -> None:
         """Shut down the client and clean up resources."""
+        if self._closed:
+            _LOGGER.debug("Client already closed, skipping shutdown")
+            return
+            
         try:
+            # Mark as closed early to prevent new sessions from being created
+            self._closed = True
+            
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
 
             # Optionally tell the server to shut down this detector
             try:
-                session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-
                 shutdown_data = {"detector_id": self.detector_id}
-
-                async with session.post(
-                    f"{self.base_url}/shutdown", json=shutdown_data
-                ) as response:
-                    if response.status == 200:
-                        _LOGGER.info("Successfully shut down detector on server")
-                    else:
-                        _LOGGER.warning(
-                            "Failed to shut down detector on server: HTTP %s",
-                            response.status,
-                        )
+                
+                # Use a context manager to ensure the session is properly closed
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    async with session.post(
+                        f"{self.base_url}/shutdown", json=shutdown_data
+                    ) as response:
+                        if response.status == 200:
+                            _LOGGER.info("Successfully shut down detector on server")
+                        else:
+                            _LOGGER.warning(
+                                "Failed to shut down detector on server: HTTP %s",
+                                response.status,
+                            )
             except Exception as ex:
                 _LOGGER.warning("Error shutting down detector on server: %s", ex)
-            finally:
-                if session and not session.closed:
-                    await session.close()
 
             _LOGGER.info("API client closed")
         except Exception as ex:

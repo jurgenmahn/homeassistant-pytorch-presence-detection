@@ -15,6 +15,8 @@ CONF_PROCESSING_SERVER_PORT = "processing_server_port"
 CONF_USE_TCP_CONNECTION = "use_tcp_connection"
 CONF_USE_AUTO_OPTIMIZATION = "use_auto_optimization"  # New option for automatic optimization
 CONF_FRAME_SKIP_RATE = "frame_skip_rate"  # Control how many frames to skip between processing
+CONF_DETECTION_FRAME_COUNT = "detection_frame_count"  # Number of frames to use for detection
+CONF_CONSISTENT_DETECTION_COUNT = "consistent_detection_count"  # Number of consistent detections required
 
 # Entity attributes
 ATTR_DEVICE_ID = "device_id"
@@ -35,6 +37,8 @@ DEFAULT_INPUT_SIZE = "640x480"
 DEFAULT_MODEL = "yolo11l"
 DEFAULT_FRAME_SKIP_RATE_CPU = 5
 DEFAULT_FRAME_SKIP_RATE_GPU = 3
+DEFAULT_DETECTION_FRAME_COUNT = 5
+DEFAULT_CONSISTENT_DETECTION_COUNT = 3
 DEFAULT_PROCESSING_SERVER = "yolo-presence-server"
 DEFAULT_PROCESSING_SERVER_PORT = 5505
 DEFAULT_USE_TCP_CONNECTION = True  # Default to TCP connection for better performance

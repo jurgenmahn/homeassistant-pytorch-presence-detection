@@ -23,7 +23,7 @@ logger = configure_logging(
 )
 
 class RTSPStreamProcessor:
-    def __init__(self, rtsp_url, process_nth_frame=30, reconnect_delay=5):
+    def __init__(self, rtsp_url, process_nth_frame=30, reconnect_delay=5, max_stored_frames=5):
         """
         Initialize the RTSP stream processor with CUDA acceleration using OpenCV.
         
@@ -31,19 +31,21 @@ class RTSPStreamProcessor:
             rtsp_url (str): RTSP URL to connect to
             process_nth_frame (int): Process every Nth frame (skip others for efficiency)
             reconnect_delay (int): Seconds to wait before reconnection attempts
+            max_stored_frames (int): Maximum number of frames to store for processing
         """
         self.rtsp_url = rtsp_url
         self.process_nth_frame = process_nth_frame
         self.reconnect_delay = reconnect_delay
+        self.max_stored_frames = max_stored_frames  # Number of frames to store for detection
         self.frame_count = 0
-        self.last_frame = None
+        self.frame_buffer = []  # Buffer to store multiple frames
         self.running = False
         self.stop_event = threading.Event()
         self.reconnect_count = 0
         self.max_reconnect_attempts = 0  # 0 = unlimited reconnection attempts
         self.capture = None
         self.process_thread = None
-        self.last_frame_lock = threading.Lock()
+        self.frame_buffer_lock = threading.Lock()  # Lock for thread-safe access to the frame buffer
         
     def _create_capture(self):
         """Create OpenCV VideoCapture with CUDA hardware acceleration"""
@@ -122,7 +124,7 @@ class RTSPStreamProcessor:
                         time.sleep(0.1)
                     continue                    
                     
-                # save the last frame   
+                # Save the frame to buffer
                 self.set_latest_frame(frame)
 
                 # Reset failures counter on successful frame read
@@ -235,13 +237,38 @@ class RTSPStreamProcessor:
         return self.running
     
     def get_latest_frame(self):
-        """Get the latest processed frame"""
-        with self.last_frame_lock:
-            # Create a copy to prevent the frame from being modified while using it
-            if self.last_frame is not None:
-                return self.last_frame.copy()
-            return None   
+        """Get the latest processed frame (maintains backward compatibility)"""
+        frames = self.get_frames(1)
+        if frames and len(frames) > 0:
+            return frames[0]
+        return None
+    
+    def get_frames(self, num_frames=None):
+        """
+        Get the specified number of most recent frames
+        
+        Args:
+            num_frames (int): Number of frames to return, defaults to all stored frames
+        
+        Returns:
+            List of frames, most recent first
+        """
+        with self.frame_buffer_lock:
+            if not self.frame_buffer:
+                return []
+            
+            # If num_frames is None or greater than available frames, return all frames
+            count = num_frames if num_frames is not None and num_frames <= len(self.frame_buffer) else len(self.frame_buffer)
+            
+            # Return copies of the frames to prevent modification while in use
+            return [frame.copy() for frame in self.frame_buffer[:count]]
         
     def set_latest_frame(self, frame):
-        with self.last_frame_lock:
-            self.last_frame = frame
+        """Add a new frame to the frame buffer, maintaining max size"""
+        with self.frame_buffer_lock:
+            # Add new frame at the beginning (most recent first)
+            self.frame_buffer.insert(0, frame)
+            
+            # Keep only the maximum number of frames
+            if len(self.frame_buffer) > self.max_stored_frames:
+                self.frame_buffer = self.frame_buffer[:self.max_stored_frames]

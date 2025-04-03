@@ -19,12 +19,16 @@ from .const import (
     CONF_USE_TCP_CONNECTION,
     CONF_USE_AUTO_OPTIMIZATION,
     CONF_FRAME_SKIP_RATE,
+    CONF_DETECTION_FRAME_COUNT,
+    CONF_CONSISTENT_DETECTION_COUNT,
     DEFAULT_NAME,
     DEFAULT_DETECTION_INTERVAL_CPU,
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_INPUT_SIZE,
     DEFAULT_MODEL,
     DEFAULT_FRAME_SKIP_RATE_CPU,
+    DEFAULT_DETECTION_FRAME_COUNT,
+    DEFAULT_CONSISTENT_DETECTION_COUNT,
     DEFAULT_PROCESSING_SERVER,
     DEFAULT_PROCESSING_SERVER_PORT,
     DEFAULT_USE_TCP_CONNECTION,
@@ -154,8 +158,17 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         INPUT_SIZE_OPTIONS
                     ),
                     vol.Required(
-                        CONF_FRAME_SKIP_RATE, default=DEFAULT_FRAME_SKIP_RATE_CPU
+                        CONF_FRAME_SKIP_RATE, default=DEFAULT_FRAME_SKIP_RATE_CPU,
+                        description={"help_text": "Process every X frame and throw away others"}
                     ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
+                    vol.Required(
+                        CONF_DETECTION_FRAME_COUNT, default=DEFAULT_DETECTION_FRAME_COUNT,
+                        description={"help_text": "Number of frames to use for detection"}
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
+                    vol.Required(
+                        CONF_CONSISTENT_DETECTION_COUNT, default=DEFAULT_CONSISTENT_DETECTION_COUNT,
+                        description={"help_text": "Number of consistent detections required"}
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
                 }
             )
         else:
@@ -185,8 +198,18 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(
                         CONF_FRAME_SKIP_RATE,
                         default=DEFAULT_FRAME_SKIP_RATE_CPU,
-                        description={"disabled": True},
+                        description={"disabled": True, "help_text": "Process every X frame and throw away others"},
                     ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
+                    vol.Required(
+                        CONF_DETECTION_FRAME_COUNT,
+                        default=DEFAULT_DETECTION_FRAME_COUNT,
+                        description={"disabled": True, "help_text": "Number of frames to use for detection"},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
+                    vol.Required(
+                        CONF_CONSISTENT_DETECTION_COUNT,
+                        default=DEFAULT_CONSISTENT_DETECTION_COUNT,
+                        description={"disabled": True, "help_text": "Number of consistent detections required"},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
                 }
             )
 
@@ -319,7 +342,22 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                         default=current_settings.get(
                             CONF_FRAME_SKIP_RATE, DEFAULT_FRAME_SKIP_RATE_CPU
                         ),
+                        description={"help_text": "Process every X frame and throw away others"}
                     ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
+                    vol.Required(
+                        CONF_DETECTION_FRAME_COUNT,
+                        default=current_settings.get(
+                            CONF_DETECTION_FRAME_COUNT, DEFAULT_DETECTION_FRAME_COUNT
+                        ),
+                        description={"help_text": "Number of frames to use for detection"}
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
+                    vol.Required(
+                        CONF_CONSISTENT_DETECTION_COUNT,
+                        default=current_settings.get(
+                            CONF_CONSISTENT_DETECTION_COUNT, DEFAULT_CONSISTENT_DETECTION_COUNT
+                        ),
+                        description={"help_text": "Number of consistent detections required"}
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
                 }
             )
         else:
@@ -350,8 +388,18 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
                     vol.Required(
                         CONF_FRAME_SKIP_RATE,
                         default=DEFAULT_FRAME_SKIP_RATE_CPU,
-                        description={"disabled": True},
+                        description={"disabled": True, "help_text": "Process every X frame and throw away others"},
                     ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
+                    vol.Required(
+                        CONF_DETECTION_FRAME_COUNT,
+                        default=DEFAULT_DETECTION_FRAME_COUNT,
+                        description={"disabled": True, "help_text": "Number of frames to use for detection"},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
+                    vol.Required(
+                        CONF_CONSISTENT_DETECTION_COUNT,
+                        default=DEFAULT_CONSISTENT_DETECTION_COUNT,
+                        description={"disabled": True, "help_text": "Number of consistent detections required"},
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=25)),
                 }
             )
 

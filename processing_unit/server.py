@@ -67,6 +67,10 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", 5505))
 SUPPORTED_CLASSES = [0, 15, 16, 17]  # person, bird, cat, dog
 CLASS_MAP = {0: "person", 15: "bird", 16: "cat", 17: "dog"}
 
+# Default parameters that can be overridden with environment variables
+DEFAULT_DETECTION_FRAME_COUNT = int(os.environ.get("DEFAULT_DETECTION_FRAME_COUNT", 5))
+DEFAULT_CONSISTENT_DETECTION_COUNT = int(os.environ.get("DEFAULT_CONSISTENT_DETECTION_COUNT", 3))
+
 # Basic authentication settings
 # Get auth credentials from environment variables or use defaults
 AUTH_ENABLED = os.environ.get("ENABLE_AUTH", "false").lower() in ("true", "1", "yes")
@@ -116,6 +120,8 @@ class YoloDetector:
         self.detection_interval = config.get("detection_interval", 10)
         self.confidence_threshold = config.get("confidence_threshold", 0.25)
         self.frame_skip_rate = config.get("frame_skip_rate", 5)
+        self.detection_frame_count = config.get("detection_frame_count", DEFAULT_DETECTION_FRAME_COUNT)
+        self.consistent_detection_count = config.get("consistent_detection_count", DEFAULT_CONSISTENT_DETECTION_COUNT)
 
         # Auto-optimization flag
         self.auto_optimization = config.get(
@@ -128,8 +134,6 @@ class YoloDetector:
         self.frame_dimensions = (0, 0)
 
         # Frame storage for visualization
-        self.last_annotated_frame = None  # Last frame with detection boxes drawn
-        self.last_annotated_time = 0  # Timestamp when the annotated frame was created
         self.adjusted_dimensions = (0, 0)
 
         # Runtime state
@@ -307,6 +311,7 @@ class YoloDetector:
                 rtsp_url=url_to_use,
                 process_nth_frame=self.frame_skip_rate,
                 reconnect_delay=self.stream_reconnect_delay,
+                max_stored_frames=self.detection_frame_count,
             )
 
             # Start the stream processor
@@ -345,17 +350,20 @@ class YoloDetector:
             return False
 
         try:
-            # Get the latest frame from the stream processor
-            frame = self.stream_processor.get_latest_frame()
+            # Get multiple frames for detection
+            frames = self.stream_processor.get_frames(self.detection_frame_count)
 
-            if frame is None:
+            if not frames or len(frames) == 0:
                 logger.warning(
-                    f"No frame available for detection from {self.detector_id}"
+                    f"No frames available for detection from {self.detector_id}"
                 )
                 return False
+                
+            # Use the most recent frame as the primary frame
+            frame = frames[0]
 
-            # Log that we received a frame for processing
-            logger.debug(f"Got frame for detection processing: {frame.shape}")
+            # Log that we received frames for processing
+            logger.debug(f"Got {len(frames)} frames for detection processing (primary frame: {frame.shape})")
 
             # Update connection status
             self.connection_status = "connected"
@@ -402,118 +410,291 @@ class YoloDetector:
                 f"Resized frame to {adjusted_width}x{adjusted_height} for detection"
             )
 
-            # Pass the pre-resized frame to YOLO model
-            start_time = time.time()
-            results = self.model(
-                resized_frame,
-                conf=self.confidence_threshold,
-                # No need to specify imgsz since we've already resized the frame
-            )
-            inference_time = (time.time() - start_time) * 1000  # in milliseconds
-
-            # Process results
-            people_detected = False
-            pets_detected = False
-            people_count = 0
-            pet_count = 0
-
-            # Store detected objects for detailed reporting
-            detected_objects = {}
-
-            if len(results) > 0:
-                # Extract detections - YOLO v8 format
-                result = results[0]  # First batch result
-
-                # Get boxes and class information
-                boxes = result.boxes
-
-                # Use the resized frame as base for annotation
-                annotated_frame = resized_frame.copy()
-
-                # Log dimensions for debugging
-                logger.debug(
-                    f"Creating annotated frame with dimensions: {annotated_frame.shape[1]}x{annotated_frame.shape[0]}"
+            # Process all frames
+            all_frames_results = []
+            all_annotated_frames = []
+            total_inference_time = 0
+            
+            for idx, current_frame in enumerate(frames):
+                # Resize the current frame
+                current_resized = cv2.resize(
+                    current_frame, (adjusted_width, adjusted_height), interpolation=cv2.INTER_LINEAR
                 )
+                
+                # Pass the pre-resized frame to YOLO model
+                start_time = time.time()
+                current_results = self.model(
+                    current_resized,
+                    conf=self.confidence_threshold,
+                    # No need to specify imgsz since we've already resized the frame
+                )
+                frame_inference_time = (time.time() - start_time) * 1000  # in milliseconds
+                total_inference_time += frame_inference_time
+                
+                # Create a copy for annotation
+                current_annotated = current_resized.copy()
+                
+                # Process results for this frame
+                frame_people_detected = False
+                frame_pets_detected = False
+                frame_people_count = 0
+                frame_pet_count = 0
+                frame_detected_objects = {}
+                
+                if len(current_results) > 0:
+                    # Extract detections
+                    result = current_results[0]  # First batch result
+                    boxes = result.boxes
+                    
+                    for box in boxes:
+                        cls_id = int(box.cls.item())
+                        confidence = box.conf.item()
 
-                for box in boxes:
-                    cls_id = int(box.cls.item())
-                    confidence = box.conf.item()
+                        # Only process supported classes with sufficient confidence
+                        if (
+                            cls_id in SUPPORTED_CLASSES
+                            and confidence >= self.confidence_threshold
+                        ):
+                            class_name = CLASS_MAP.get(cls_id, f"class_{cls_id}")
 
-                    # Only process supported classes with sufficient confidence
-                    if (
-                        cls_id in SUPPORTED_CLASSES
-                        and confidence >= self.confidence_threshold
-                    ):
-                        class_name = CLASS_MAP.get(cls_id, f"class_{cls_id}")
+                            # Count in detected objects
+                            if class_name not in frame_detected_objects:
+                                frame_detected_objects[class_name] = 0
+                            frame_detected_objects[class_name] += 1
 
-                        # Count in detected objects
-                        if class_name not in detected_objects:
-                            detected_objects[class_name] = 0
-                        detected_objects[class_name] += 1
+                            if cls_id == 0:  # Person
+                                frame_people_detected = True
+                                frame_people_count += 1
+                            elif cls_id in [15, 16, 17]:  # Bird, cat, dog
+                                frame_pets_detected = True
+                                frame_pet_count += 1
 
-                        if cls_id == 0:  # Person
-                            people_detected = True
-                            people_count += 1
-                            logger.debug(
-                                f"Person detected with confidence {confidence:.2f}"
+                            # Get box coordinates and draw on the frame
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            
+                            # Ensure coordinates are within bounds
+                            annotated_height, annotated_width = current_annotated.shape[:2]
+                            x1 = max(0, min(annotated_width - 1, x1))
+                            y1 = max(0, min(annotated_height - 1, y1))
+                            x2 = max(0, min(annotated_width - 1, x2))
+                            y2 = max(0, min(annotated_height - 1, y2))
+                            
+                            # Draw rectangle
+                            color = (0, 255, 0) if cls_id == 0 else (0, 165, 255)
+                            cv2.rectangle(current_annotated, (x1, y1), (x2, y2), color, 2)
+                            
+                            # Prepare label with class name and confidence
+                            label = f"{class_name} {confidence:.2f}"
+                            text_size, _ = cv2.getTextSize(
+                                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
                             )
-                        elif cls_id in [15, 16, 17]:  # Bird, cat, dog
-                            pets_detected = True
-                            pet_count += 1
-                            logger.debug(
-                                f"{class_name} detected with confidence {confidence:.2f}"
+                            
+                            # Draw label background
+                            cv2.rectangle(
+                                current_annotated,
+                                (x1, y1 - text_size[1] - 5),
+                                (x1 + text_size[0], y1),
+                                color,
+                                -1,
                             )
-
-                        # Get box coordinates (xyxy format) - these are already for the resized frame
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-                        # Convert to integers
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-
-                        # Log the raw coordinates
-                        logger.debug(
-                            f"Detection coordinates: ({x1}, {y1}) to ({x2}, {y2})"
-                        )
-
-                        # Ensure coordinates are within the resized frame bounds
-                        # OpenCV shape is (height, width)
-                        annotated_height, annotated_width = annotated_frame.shape[:2]
-                        x1 = max(0, min(annotated_width - 1, x1))
-                        y1 = max(0, min(annotated_height - 1, y1))
-                        x2 = max(0, min(annotated_width - 1, x2))
-                        y2 = max(0, min(annotated_height - 1, y2))
-
-                        # Draw rectangle
-                        color = (
-                            (0, 255, 0) if cls_id == 0 else (0, 165, 255)
-                        )  # Green for people, orange for pets
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-
-                        # Prepare label with class name and confidence
-                        label = f"{class_name} {confidence:.2f}"
-                        text_size, _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
-                        )
-
-                        # Draw label background
-                        cv2.rectangle(
-                            annotated_frame,
-                            (x1, y1 - text_size[1] - 5),
-                            (x1 + text_size[0], y1),
-                            color,
-                            -1,
-                        )
-
-                        # Draw label text
-                        cv2.putText(
-                            annotated_frame,
-                            label,
-                            (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 0, 0),
-                            2,
-                        )
+                            
+                            # Draw label text
+                            cv2.putText(
+                                current_annotated,
+                                label,
+                                (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 0, 0),
+                                2,
+                            )
+                
+                # Create function to add text with background
+                def add_text_with_background(image, text, position, font, font_scale, text_color, text_thickness):
+                    # Get text size
+                    text_size, _ = cv2.getTextSize(text, font, font_scale, text_thickness)
+                    text_w, text_h = text_size
+                    x, y = position
+                    
+                    # Draw background rectangle (slightly larger than text)
+                    padding = 5
+                    cv2.rectangle(
+                        image,
+                        (x - padding, y - text_h - padding),
+                        (x + text_w + padding, y + padding),
+                        (0, 0, 0),
+                        -1
+                    )
+                    
+                    # Draw text
+                    cv2.putText(
+                        image,
+                        text,
+                        position,
+                        font,
+                        font_scale,
+                        text_color,
+                        text_thickness
+                    )                
+                
+                # Add a frame number and timestamp to the annotated frame
+                current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                add_text_with_background(
+                    current_annotated,
+                    f"Frame {idx+1}/{len(frames)} - {current_time}",
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+                
+                # Add detection stats to the frame
+                add_text_with_background(
+                    current_annotated,
+                    f"People: {frame_people_count}, Pets: {frame_pet_count}",
+                    (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, 
+                    (0, 255, 0),
+                    2
+                )
+                
+                # Add inference time
+                add_text_with_background(
+                    current_annotated,
+                    f"Inference: {frame_inference_time:.1f}ms",
+                    (10, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+                
+                # Store results for this frame
+                all_frames_results.append({
+                    "people_detected": frame_people_detected,
+                    "pets_detected": frame_pets_detected,
+                    "people_count": frame_people_count,
+                    "pet_count": frame_pet_count,
+                    "detected_objects": frame_detected_objects,
+                    "inference_time": frame_inference_time
+                })
+                
+                all_annotated_frames.append(current_annotated)
+            
+            # Calculate average inference time
+            inference_time = total_inference_time / len(frames)
+            
+            # Count consistent detections to determine final state
+            people_detection_count = sum(1 for r in all_frames_results if r["people_detected"])
+            pets_detection_count = sum(1 for r in all_frames_results if r["pets_detected"])
+            
+            # Determine if we have consistent detections
+            people_detected = people_detection_count >= self.consistent_detection_count
+            pets_detected = pets_detection_count >= self.consistent_detection_count
+            
+            # For counts, let's use the median count across all frames
+            all_people_counts = [r["people_count"] for r in all_frames_results]
+            all_pet_counts = [r["pet_count"] for r in all_frames_results]
+            
+            # Sort and take the middle value as median
+            all_people_counts.sort()
+            all_pet_counts.sort()
+            people_count = all_people_counts[len(all_people_counts) // 2] if all_people_counts else 0
+            pet_count = all_pet_counts[len(all_pet_counts) // 2] if all_pet_counts else 0
+            
+            # Create a merged detected_objects dictionary from all frames
+            detected_objects = {}
+            
+            # Combine all detected objects from all frames
+            for result in all_frames_results:
+                for obj_type, count in result["detected_objects"].items():
+                    if obj_type not in detected_objects:
+                        detected_objects[obj_type] = 0
+                    detected_objects[obj_type] += count
+            
+            # Normalize the counts by dividing by the number of frames
+            for obj_type in detected_objects:
+                detected_objects[obj_type] = detected_objects[obj_type] // len(frames)
+            
+            # Create a combined visualization with all frames
+            # For single frame case, just use the first annotated frame
+            if len(all_annotated_frames) == 1:
+                annotated_frame = all_annotated_frames[0]
+            else:
+                # Create a grid layout to show all frames
+                # Determine grid dimensions (trying for square-ish layout)
+                grid_size = int(np.ceil(np.sqrt(len(all_annotated_frames))))
+                rows = grid_size
+                cols = grid_size
+                
+                # Determine the size of each grid cell based on the frame dimensions
+                cell_height, cell_width = all_annotated_frames[0].shape[:2]
+                
+                # Create the grid canvas
+                grid_height = rows * cell_height
+                grid_width = cols * cell_width
+                grid_canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+                
+                # Place each frame in the grid
+                for i, frame in enumerate(all_annotated_frames):
+                    if i >= rows * cols:
+                        break  # Skip if we run out of grid cells
+                        
+                    row = i // cols
+                    col = i % cols
+                    
+                    y_start = row * cell_height
+                    y_end = y_start + cell_height
+                    x_start = col * cell_width
+                    x_end = x_start + cell_width
+                    
+                    grid_canvas[y_start:y_end, x_start:x_end] = frame
+                
+                # Add a summary overlay across the bottom of all frames
+                # Add a bar at the bottom with summary information
+                status_bar_height = 120
+                status_bar = np.zeros((status_bar_height, grid_width, 3), dtype=np.uint8)
+                
+                # Add detection summary to the status bar
+                cv2.putText(
+                    status_bar,
+                    f"Overall detection: People {people_detection_count}/{len(frames)}, " +
+                    f"Pets {pets_detection_count}/{len(frames)}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2
+                )
+                
+                # Show detection thresholds
+                cv2.putText(
+                    status_bar,
+                    f"Required consistent detections: {self.consistent_detection_count}/{len(frames)}",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2
+                )
+                
+                # Show detection status and counts
+                status_color = (0, 255, 0) if people_detected or pets_detected else (0, 0, 255)
+                cv2.putText(
+                    status_bar,
+                    f"Final: People={people_detected}({people_count}), Pets={pets_detected}({pet_count})",
+                    (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    status_color,
+                    2
+                )
+                
+                # Combine the grid and status bar
+                annotated_frame = np.vstack((grid_canvas, status_bar))
 
             # Update detection state
             self.people_detected = people_detected
@@ -530,85 +711,11 @@ class YoloDetector:
             # Store the adjusted dimensions that were actually used
             self.adjusted_dimensions = (adjusted_width, adjusted_height)
 
-            # Add semi-transparent background and text overlay for annotations
-            overlay = annotated_frame.copy()
-            
-            # Create function to add text with background
-            def add_text_with_background(image, text, position, font, font_scale, text_color, text_thickness):
-                # Get text size
-                text_size, _ = cv2.getTextSize(text, font, font_scale, text_thickness)
-                text_w, text_h = text_size
-                x, y = position
-                
-                # Draw background rectangle (slightly larger than text)
-                padding = 5
-                cv2.rectangle(
-                    image,
-                    (x - padding, y - text_h - padding),
-                    (x + text_w + padding, y + padding),
-                    (0, 0, 0),
-                    -1
-                )
-                
-                # Draw text
-                cv2.putText(
-                    image,
-                    text,
-                    position,
-                    font,
-                    font_scale,
-                    text_color,
-                    text_thickness
-                )
-            
-            # Add timestamp and extra info to the annotated frame
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-            add_text_with_background(
-                overlay,
-                f"Time: {current_time}",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-            # Add detection stats
-            info_text = f"People: {people_count}, Pets: {pet_count}"
-            add_text_with_background(
-                overlay,
-                info_text,
-                (10, 55), 
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-            # Add inference time
-            add_text_with_background(
-                overlay,
-                f"Inference: {inference_time:.1f}ms",
-                (10, 85),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-            
-            # Add semi-transparent overlay to the original frame
-            alpha = 0.7  # Transparency factor
-            cv2.addWeighted(overlay, alpha, annotated_frame, 1 - alpha, 0, annotated_frame)
-
-            # Store the annotated frame for visualization endpoint
-            self.last_annotated_frame = annotated_frame
-            self.last_annotated_time = time.time()
-
             # Store the image in the global processed_images dict for the /jpeg endpoint
             with processed_images_lock:
-                # Encode as JPEG
+                # Encode as high-quality JPEG for larger displays
                 _, jpg_data = cv2.imencode(
-                    ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                    ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
                 )
                 processed_images[self.detector_id] = jpg_data.tobytes()
                 logger.debug(
@@ -624,13 +731,15 @@ class YoloDetector:
 
             # Log detection with detailed information
             logger.info(
-                f"Detection for {self.detector_id}: people={people_detected}({people_count}), "
-                f"pets={pets_detected}({pet_count}), "
+                f"Detection for {self.detector_id}: "
+                f"people={people_detected}({people_count}) [{people_detection_count}/{len(frames)}], "
+                f"pets={pets_detected}({pet_count}) [{pets_detection_count}/{len(frames)}], "
+                f"consistent threshold={self.consistent_detection_count}, "
                 f"objects: {detection_report}, "
                 f"time: {inference_time:.1f}ms, "
+                f"frames processed: {len(frames)}/{self.detection_frame_count}, "
                 f"original size: {original_width}x{original_height}, "
-                f"processed size: {adjusted_width}x{adjusted_height}, "
-                f"boxes correctly drawn on resized frame"
+                f"processed size: {adjusted_width}x{adjusted_height}"
             )
 
             return True
@@ -697,6 +806,8 @@ class YoloDetector:
             "detection_interval": self.detection_interval,
             "confidence_threshold": self.confidence_threshold,
             "frame_skip_rate": self.frame_skip_rate,
+            "detection_frame_count": self.detection_frame_count,
+            "consistent_detection_count": self.consistent_detection_count,
             "is_running": self.is_running,
             "connection_status": self.connection_status,
             "device": self.device,
@@ -810,6 +921,28 @@ def create_or_update_detector(
                 except Exception as ex:
                     logger.warning(
                         f"Invalid frame_skip_rate: {config.get('frame_skip_rate')} - {ex}"
+                    )
+                    
+            if config.get("detection_frame_count") is not None:
+                try:
+                    frame_count = int(config["detection_frame_count"])
+                    if frame_count != detector.detection_frame_count:
+                        detector.detection_frame_count = frame_count
+                        updated_settings.append("detection_frame_count")
+                except Exception as ex:
+                    logger.warning(
+                        f"Invalid detection_frame_count: {config.get('detection_frame_count')} - {ex}"
+                    )
+                    
+            if config.get("consistent_detection_count") is not None:
+                try:
+                    consistent_count = int(config["consistent_detection_count"])
+                    if consistent_count != detector.consistent_detection_count:
+                        detector.consistent_detection_count = consistent_count
+                        updated_settings.append("consistent_detection_count")
+                except Exception as ex:
+                    logger.warning(
+                        f"Invalid consistent_detection_count: {config.get('consistent_detection_count')} - {ex}"
                     )
 
             # Auto configure if requested and enabled
@@ -1452,19 +1585,19 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             logger.debug(
                                 f"No processed image found for detector {detector_id}, creating placeholder"
                             )
-                            # If no processed image exists yet, create a placeholder
-                            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                            # If no processed image exists yet, create a larger placeholder
+                            placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
                             cv2.putText(
                                 placeholder,
                                 "Waiting for detection...",
-                                (50, 240),
+                                (400, 360),
                                 cv2.FONT_HERSHEY_SIMPLEX,
-                                1,
-                                (255, 255, 255),
                                 2,
+                                (255, 255, 255),
+                                3,
                             )
                             _, jpg_data = cv2.imencode(
-                                ".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                                ".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 95]
                             )
                             jpg_bytes = jpg_data.tobytes()
                         else:
@@ -1513,7 +1646,10 @@ class YoloHTTPHandler(BaseHTTPRequestHandler):
                             "connection_status": detector.connection_status,
                             "input_width": detector.input_width,
                             "input_height": detector.input_height,
-                            "confidence_threshold": detector.confidence_threshold
+                            "confidence_threshold": detector.confidence_threshold,
+                            "frame_skip_rate": detector.frame_skip_rate,
+                            "detection_frame_count": detector.detection_frame_count,
+                            "consistent_detection_count": detector.consistent_detection_count
                         }
                         
                         # Render the template

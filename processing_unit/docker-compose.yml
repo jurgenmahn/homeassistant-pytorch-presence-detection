@@ -14,6 +14,8 @@ services:
     environment:
       - HTTP_PORT=5505
       - DEBUG=false
+      - DEFAULT_DETECTION_FRAME_COUNT=5
+      - DEFAULT_CONSISTENT_DETECTION_COUNT=3
     deploy:
       resources:
         reservations:

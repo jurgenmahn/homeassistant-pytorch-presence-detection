@@ -5,14 +5,14 @@
     <style>
         body { font-family: Arial, sans-serif; margin: 0; padding: 20px; text-align: center; background-color: #f0f0f0; }
         h1 { color: #333; }
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1700px; margin: 0 auto; }
         .info { 
             background-color: #fff; 
             padding: 15px; 
             border-radius: 5px; 
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
             margin: 20px auto;
-            max-width: 1024px;
+            max-width: 1600px;
             text-align: left;
         }
         .detector-name { font-weight: bold; font-size: 18px; }
@@ -33,18 +33,18 @@
         .refresh-btn:hover { background-color: #0069d9; }
         #image-container {
             width: 100%;
-            max-width: 1024px;
+            max-width: 1600px;
             margin: 20px auto;
             border: 2px solid #333;
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
             background-color: #000;
             position: relative;
-            min-height: 480px;
+            min-height: 720px;
         }
         #detector-image {
             width: 100%;
             height: auto;
-            min-height: 480px;
+            min-height: 720px;
             display: block;
             object-fit: contain;
         }
@@ -61,17 +61,20 @@
             <p>Status: <span class="status {{connection_status}}">{{connection_status}}</span></p>
             <p>Resolution: {{input_width}}x{{input_height}}</p>
             <p>Confidence threshold: {{confidence_threshold}}</p>
+            <p>Frame skip rate: {{frame_skip_rate}}</p>
+            <p>Detection frame count: {{detection_frame_count}}</p>
+            <p>Consistent detection count: {{consistent_detection_count}}</p>
         </div>
         
         <div id="image-container">
             <img id="detector-image" src="/jpeg?detector_id={{detector_id}}" alt="Live detection stream" />
         </div>
         
-        <div id="status-info" style="margin:10px auto; padding:8px; background-color:#f0f0f0; border-radius:4px; max-width:1024px; text-align:center; font-weight:bold;">
+        <div id="status-info" style="margin:10px auto; padding:8px; background-color:#f0f0f0; border-radius:4px; max-width:1600px; text-align:center; font-weight:bold;">
             Starting...
         </div>
         
-        <div style="margin:10px auto; max-width:1024px;">
+        <div style="margin:10px auto; max-width:1600px;">
             <button id="play-pause-btn" class="refresh-btn" style="margin-right:10px;">Pause</button>
             <button class="refresh-btn" onclick="window.location.reload()">Refresh Page</button>
         </div>
