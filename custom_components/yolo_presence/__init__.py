@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 import datetime as dt
 
@@ -26,6 +26,9 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 # We'll calculate the actual check interval dynamically based on the config
+
+# Store cancel callback functions for interval timers
+TIMERS = {}
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -143,9 +146,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Setting up detector check with interval: {detection_interval} seconds"
         )
 
-        entry.async_on_unload(
-            async_track_time_interval(hass, check_detector_status, check_interval)
+        # Store the cancel callback function to ensure we can explicitly cancel it later
+        timer_cancel_callback = async_track_time_interval(
+            hass, check_detector_status, check_interval
         )
+
+        # Store in both places for redundancy
+        TIMERS[entry.entry_id] = timer_cancel_callback
+        entry.async_on_unload(timer_cancel_callback)
 
         # Run initial check after a short delay
         async def initial_check() -> None:
@@ -161,6 +169,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     except Exception as ex:
         _LOGGER.error(f"Error setting up entry {entry.title}: {ex}")
+
+        # Clean up any timer that might have been created
+        if entry.entry_id in TIMERS:
+            _LOGGER.debug(f"Cleaning up timer after setup error for {entry.title}")
+            TIMERS.pop(entry.entry_id)()
+
         # Clean up any partial setup
         if entry.entry_id in hass.data.get(DOMAIN, {}):
             hass.data[DOMAIN].pop(entry.entry_id)
@@ -175,6 +189,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug(f"Unloading entry {entry.title}")
 
     try:
+        # First, explicitly cancel the interval timer if it exists
+        if entry.entry_id in TIMERS:
+            _LOGGER.debug(f"Explicitly canceling timer for {entry.title}")
+            cancel_cb = TIMERS.pop(entry.entry_id)
+            cancel_cb()  # This calls the cancel function to stop the timer
+
         # Unload sensors and binary sensors
         unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
@@ -206,8 +226,13 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     # Make sure we completely unload the integration before setting up again
     await async_unload_entry(hass, entry)
 
+    # Make one final check to ensure timer is canceled
+    if entry.entry_id in TIMERS:
+        _LOGGER.debug(f"Final cleanup of timer for {entry.title} during reload")
+        TIMERS.pop(entry.entry_id)()  # Get and call the cancel callback in one step
+
     # Remove any existing data to prevent conflicts
-    if entry.entry_id in hass.data[DOMAIN]:
+    if entry.entry_id in hass.data.get(DOMAIN, {}):
         hass.data[DOMAIN].pop(entry.entry_id)
 
     # Set up the entry again
