@@ -1,26 +1,23 @@
 # Home Assistant YOLO Presence Detection Integration
 
-This integration provides presence detection using YOLO object detection on camera streams. It uses a separate processing server to handle the video processing and ML inference, while providing seamless integration with Home Assistant entities and automations.
+## Why Use This Integration?
 
-## Major Update: Poll-Based Architecture
+Traditional motion sensors fail in one critical scenario: detecting people who are sitting still. Whether you're reading a book, watching TV, or working at your desk, standard motion sensors will falsely report an empty room once movement stops. This leads to lights turning off while you're still present, thermostats reducing heating in occupied spaces, and security systems making incorrect assessments.
 
-This is a major update to the YOLO Presence Detection integration, introducing a new poll-based HTTP architecture:
+The YOLO Presence Detection Integration solves this problem by using computer vision and machine learning to actively recognize people and pets in your camera feeds - whether they're moving or completely still. This enables truly reliable presence detection for:
 
-1. **Home Assistant Integration**: Controls when detection happens through regular HTTP polling
-2. **Processing Server**: A separate Docker container that maintains stream connections and performs detection on demand
+- Living rooms where people watch TV or read
+- Home offices with seated workers
+- Bedrooms where people might be sleeping
+- Any space where traditional motion detection falls short
 
-This architecture provides several benefits:
-- **Reliability**: Stream connections are maintained in the background, but resource-intensive detection only happens when requested
-- **Control**: Home Assistant controls the frequency of detection through configurable polling intervals
-- **Resource Management**: Processing server can handle multiple streams efficiently with automatic resource optimization
-- **Resilience**: Polling architecture is more resilient to network issues and interruptions
-- **Recovery**: Automatic reconnection and health monitoring ensures continuous operation
+Get accurate presence data for smarter automations, better energy management, and improved security.
 
 ## Features
 
-- **Person Detection**: Detects when people are present in the camera feed
-- **Pet Detection**: Detects cats and dogs in the camera feed
-- **Counting**: Counts the number of people and pets detected
+- **Person Detection**: Detects when people are present in the camera feed, even when sitting still
+- **Pet Detection**: Identifies cats and dogs in the camera feed
+- **Counting**: Tracks the number of people and pets detected
 - **GPU Acceleration**: Automatically uses GPU acceleration (CUDA) when available
 - **Adjustable Parameters**: Configure detection thresholds, intervals, and resolution
 - **Multiple Models**: Choose from different YOLO models based on your hardware capabilities
@@ -39,8 +36,6 @@ This architecture provides several benefits:
 cd processing_unit
 docker-compose up -d
 ```
-
-For more details, see the processing server documentation below.
 
 ### Step 2: Install the Home Assistant Integration
 
@@ -108,15 +103,14 @@ The integration fires the following events:
 | Input Resolution | Resolution for processing (adjusted to be multiple of 32) | 640x480 |
 | Frame Skip Rate | Process 1 out of X frames | 5 (CPU), 3 (GPU) |
 
-### Poll-Based Detection
+## System Architecture
 
 The integration uses a poll-based architecture where:
 
-- Home Assistant polls the server at regular intervals (as set by Detection Interval)
+- Home Assistant polls the server at regular intervals
 - The server maintains camera stream connections in the background
 - Detection only happens when a poll request is received
 - Results are returned immediately in the HTTP response
-- Each poll includes the full detector configuration
 
 Benefits of this approach:
 - Reduced resource usage when detection isn't needed
@@ -125,30 +119,171 @@ Benefits of this approach:
 - Easier to monitor and debug
 - Configurable detection frequency
 
-### Auto-Optimization
-
-The integration includes an automatic resource optimization feature that:
-
-- Automatically adjusts detection settings based on server resource usage
-- Monitors CPU, memory, and GPU usage in real-time
-- Scales back resource usage when the server is under heavy load
-- Improves performance automatically when resources are available
-- Adjusts parameters based on stream connection health
+## Auto-Optimization
 
 When auto-optimization is enabled:
-- Manual configuration fields for model, interval, resolution, etc. are disabled
-- The server continuously monitors resource usage and adjusts settings
-- Optimization happens transparently without disrupting detection
+- The server monitors CPU, memory, and GPU usage in real-time
+- Detection settings are automatically adjusted based on server load
+- Performance improves automatically when resources are available
+- Manual configuration fields are disabled
+
+## API Documentation
+
+The processing server exposes several HTTP endpoints for integration with Home Assistant and other clients. Here's how to interact with the API:
+
+### Key Endpoints
+
+#### 1. Poll Endpoint - `/poll` (POST)
+
+The primary endpoint used by the Home Assistant integration to create/update a detector, perform detection, and get results.
+
+**Request payload:**
+```json
+{
+  "detector_id": "unique_id",
+  "config": {
+    "stream_url": "rtsp://username:password@camera-ip:554/stream",
+    "name": "Living Room Camera",
+    "model": "yolo11l",
+    "input_size": "640x480",
+    "detection_interval": 10,
+    "confidence_threshold": 0.25,
+    "frame_skip_rate": 5,
+    "detection_frame_count": 5,
+    "consistent_detection_count": 3,
+    "use_auto_optimization": false
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "detector_id": "unique_id",
+  "detection_time": 0.123,
+  "state": {
+    "human_detected": true,
+    "pet_detected": false,
+    "human_count": 2,
+    "pet_count": 0,
+    "connection_status": "connected",
+    "last_update": 1616867123.45,
+    "inference_time_ms": 124.5,
+    "detected_objects": {"person": 2},
+    "requested_resolution": "640x480",
+    "actual_resolution": "640x480"
+  }
+}
+```
+
+#### 2. Shutdown Endpoint - `/shutdown` (POST)
+
+Gracefully shuts down a detector instance and frees associated resources.
+
+**Request payload:**
+```json
+{
+  "detector_id": "unique_id"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Detector unique_id shutdown"
+}
+```
+
+#### 3. State Endpoint - `/state` (GET)
+
+Gets the current state of a detector without performing detection.
+
+**Query parameter:**
+- `detector_id=unique_id`
+
+**Response:**
+```json
+{
+  "status": "success",
+  "detector_id": "unique_id",
+  "state": {
+    "detector_id": "unique_id",
+    "name": "Living Room Camera",
+    "stream_url": "rtsp://username:password@camera-ip:554/stream",
+    "model": "yolo11l",
+    "input_size": "640x480",
+    "detection_interval": 10,
+    "confidence_threshold": 0.25,
+    "frame_skip_rate": 5,
+    "detection_frame_count": 5,
+    "consistent_detection_count": 3,
+    "is_running": true,
+    "connection_status": "connected",
+    "device": "cuda:0",
+    "human_detected": true,
+    "pet_detected": false,
+    "human_count": 2,
+    "pet_count": 0
+  }
+}
+```
+
+#### 4. Detectors List - `/detectors` (GET)
+
+Lists all active detectors with basic information.
+
+**Response:**
+```json
+{
+  "status": "success",
+  "detectors": [
+    {
+      "detector_id": "unique_id1",
+      "name": "Living Room Camera",
+      "is_running": true,
+      "connection_status": "connected"
+    },
+    {
+      "detector_id": "unique_id2",
+      "name": "Front Door Camera",
+      "is_running": true,
+      "connection_status": "connected"
+    }
+  ]
+}
+```
+
+#### 5. Health Check - `/health` (GET)
+
+Simple endpoint to verify the server is running.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "message": "Server is running",
+  "detector_count": 2
+}
+```
+
+### Visual Endpoints
+
+The following endpoints provide visual access to detector streams:
+
+- **View UI** - `/view?detector_id=unique_id`: HTML page with live stream and detection visualizations
+- **Direct JPEG** - `/jpeg?detector_id=unique_id`: Latest processed JPEG image with detection annotations
+- **Main Dashboard** - `/`: Lists all active detectors with status and links to individual views
 
 ## Hardware Requirements
 
 ### For the Processing Server:
 - Any machine capable of running Docker
-- For GPU acceleration: NVIDIA GPU with CUDA support
-- At least 4GB of RAM (8GB+ recommended for larger models)
+- For GPU acceleration: NVIDIA GPU with CUDA support, at least 1GB of VRAM (2GB for larger models)
 
 ### For Home Assistant:
-- Regular Home Assistant requirements (much lighter than before as processing happens externally)
+- Regular Home Assistant requirements (as processing happens externally)
 
 ## Models
 
@@ -158,50 +293,74 @@ When auto-optimization is enabled:
 - **YOLO11 Large**: Good accuracy, moderate performance requirements
 - **YOLO11 Extra Large**: Best accuracy, highest resource usage
 
+## Processing Server Details
+
+The processing server includes:
+
+- HTTP Server for handling requests
+- YOLO Model Management
+- Stream Monitoring in background threads
+- Resource Monitoring for auto-optimization
+- Web Interface for visual monitoring
+
+### API Endpoints
+
+- `GET /`: Main web interface
+- `GET /health`: Server health check
+- `POST /poll`: Main endpoint for detection polling
+- `POST /shutdown`: Gracefully shut down a detector
+- `GET /state`: Get current detector state
+- `GET /detectors`: List all active detectors
+- `GET /view?detector_id=ID`: Visual detector monitoring
+- `GET /stream?detector_id=ID`: MJPEG stream access
+
+## Web Interface
+
+The processing server includes a built-in web interface that provides visual monitoring and management of your detection streams. This interface is accessible at `http://<server-ip>:5505/` by default.
+
+### Key Features
+
+- **Dashboard Overview**: The main page lists all active detectors with their status, model, and detection counts
+- **Live Stream Viewing**: Each detector has a dedicated view page showing the camera feed with real-time detection overlays
+- **Detection Visualization**: Bounding boxes highlight detected people and pets with confidence scores
+- **Detection Statistics**: View counts, inference times, and detection history
+- **Multi-frame Analysis**: See all frames used in the detection process with a summary of results
+- **Mobile-Friendly Design**: Responsive layout works on phones, tablets, and desktops
+
+### Usage Scenarios
+
+- **Setup & Configuration**: Verify camera streams are properly connected during initial setup
+- **Performance Tuning**: Monitor inference times and detection quality to optimize settings 
+- **Troubleshooting**: Diagnose connection issues or unexpected detection results visually
+- **Monitoring**: Keep an eye on protected areas from any web browser
+
+### Web Interface Security
+
+For security in shared environments, you can enable basic authentication for the web interface by setting `ENABLE_AUTH=true` in the docker-compose.yml file.
+
 ## Troubleshooting
 
-- **HTTP Polling Issues**: If entities aren't updating, check that the configured detection interval is appropriate
+- **HTTP Polling Issues**: Check that the detection interval is appropriate
 - **Inconsistent Detection**: Try increasing the confidence threshold or using a more accurate model
 - **High CPU Usage**: Use a smaller model or increase the detection interval
 - **Memory Issues**: Lower the input resolution or reduce the frame skip rate
-- **Connection Problems**: Verify your RTSP URL is correct and accessible from the processing server
-- **Performance Insights**: Review the detector output in the logs, which includes detailed information about:
-  - Detection times in milliseconds
-  - Original frame dimensions vs. model input dimensions
-  - Auto-optimization status and adjustments
-  - Detected objects and their counts
+- **Connection Problems**: Verify your RTSP URL is correct and accessible
+- **Logs**: Check Docker logs with `docker-compose logs -f`
+- **RTSP with Credentials**: Ensure they're properly URL-encoded
+- **For CPU-only Systems**: Remove the `deploy.resources` section from `docker-compose.yml`
 
 ## RTSP Stream Compatibility
 
-The system supports various RTSP stream formats:
-
+The system supports:
 - Standard RTSP streams from IP cameras
 - RTSP streams with credentials (username:password format)
 - HTTP video streams
 - ONVIF-compliant camera streams
 
 For optimal performance:
-- Configure your camera for H.264 encoding when possible
-- Use a resolution appropriate for detection (720p or lower recommended)
-- Ensure your network has sufficient bandwidth between the processing server and camera
-
-## Processing Server Architecture
-
-The processing server component has the following key components:
-
-1. **HTTP Server**: Handles requests from Home Assistant clients
-2. **YOLO Model Management**: Loads and configures YOLO models for detection
-3. **Stream Monitor**: Background threads that maintain camera connections
-4. **Detector Instances**: One per configured camera, maintaining state
-5. **Resource Monitor**: Monitors system resources for auto-optimization
-
-### API Endpoints
-
-- `GET /health`: Server health check
-- `POST /poll`: Main endpoint for detection polling
-- `POST /shutdown`: Gracefully shut down a detector
-- `GET /state`: Get current detector state
-- `GET /detectors`: List all active detectors
+- Use H.264 encoding when possible
+- Use 720p or lower resolution for detection
+- Ensure sufficient network bandwidth
 
 ## License
 
