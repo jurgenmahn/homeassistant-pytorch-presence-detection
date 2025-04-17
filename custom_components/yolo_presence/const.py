@@ -13,10 +13,18 @@ CONF_MODEL = "model"
 CONF_PROCESSING_SERVER = "processing_server"
 CONF_PROCESSING_SERVER_PORT = "processing_server_port"
 CONF_USE_TCP_CONNECTION = "use_tcp_connection"
-CONF_USE_AUTO_OPTIMIZATION = "use_auto_optimization"  # New option for automatic optimization
-CONF_FRAME_SKIP_RATE = "frame_skip_rate"  # Control how many frames to skip between processing
-CONF_DETECTION_FRAME_COUNT = "detection_frame_count"  # Number of frames to use for detection
-CONF_CONSISTENT_DETECTION_COUNT = "consistent_detection_count"  # Number of consistent detections required
+CONF_USE_AUTO_OPTIMIZATION = (
+    "use_auto_optimization"  # New option for automatic optimization
+)
+CONF_FRAME_SKIP_RATE = (
+    "frame_skip_rate"  # Control how many frames to skip between processing
+)
+CONF_DETECTION_FRAME_COUNT = (
+    "detection_frame_count"  # Number of frames to use for detection
+)
+CONF_CONSISTENT_DETECTION_COUNT = (
+    "consistent_detection_count"  # Number of consistent detections required
+)
 
 # Entity attributes
 ATTR_DEVICE_ID = "device_id"
@@ -42,7 +50,9 @@ DEFAULT_CONSISTENT_DETECTION_COUNT = 3
 DEFAULT_PROCESSING_SERVER = "yolo-presence-server"
 DEFAULT_PROCESSING_SERVER_PORT = 5505
 DEFAULT_USE_TCP_CONNECTION = True  # Default to TCP connection for better performance
-DEFAULT_USE_AUTO_OPTIMIZATION = False  # Default to manual settings for backward compatibility
+DEFAULT_USE_AUTO_OPTIMIZATION = (
+    False  # Default to manual settings for backward compatibility
+)
 
 # SCAN_INTERVAL for sensors updates (seconds)
 SCAN_INTERVAL = 1
@@ -53,7 +63,7 @@ MODEL_OPTIONS = {
     "yolo11s": "YOLO11 Small (Fast, good accuracy)",
     "yolo11m": "YOLO11 Medium (Balanced speed/accuracy)",
     "yolo11l": "YOLO11 Large (Slower, high accuracy)",
-    "yolo11x": "YOLO11 Extra Large (Slowest, highest accuracy)"
+    "yolo11x": "YOLO11 Extra Large (Slowest, highest accuracy)",
 }
 
 # Input size options
@@ -64,12 +74,7 @@ INPUT_SIZE_OPTIONS = ["320x240", "640x480", "1280x720", "1920x1080"]
 SUPPORTED_CLASSES = [0, 15, 16, 17]
 
 # Class mapping
-CLASS_MAP = {
-    0: "person",
-    15: "bird",
-    16: "cat", 
-    17: "dog"
-}
+CLASS_MAP = {0: "person", 15: "bird", 16: "cat", 17: "dog"}
 
 # Connection status
 CONNECTION_STATUS_OPTIONS = {

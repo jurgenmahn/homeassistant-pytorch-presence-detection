@@ -55,19 +55,23 @@ class YoloProcessingApiClient:
         self.detector_id = detector_id
         self.update_interval = update_interval
 
-        _LOGGER.info("Initializing YOLO HTTP client for %s with update interval: %s seconds", 
-                    self.base_url, self.update_interval)
+        _LOGGER.info(
+            "Initializing YOLO HTTP client for %s with update interval: %s seconds",
+            self.base_url,
+            self.update_interval,
+        )
 
         # State tracking
         self._human_detected = False
         self._pet_detected = False
         self._human_count = 0
         self._pet_count = 0
-        self._last_update = None
+        self._last_update: Optional[dt_util.dt.datetime] = None
         self._available = False
-        self._last_error = None
-        self._session = None
+        self._last_error: Optional[str] = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self._closed = False  # Flag to track if the client has been closed
+        self._config: Dict[str, Any] = {}
 
         # Callback management
         self._update_callbacks: List[Callable[[], None]] = []
@@ -77,7 +81,7 @@ class YoloProcessingApiClient:
         if self._closed:
             _LOGGER.warning("Attempting to get session on closed client")
             raise RuntimeError("Client is closed")
-            
+
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -91,19 +95,20 @@ class YoloProcessingApiClient:
             session = await self._get_session()
 
             # Prepare the poll data with detector configuration
+            config_data = {
+                "name": f"HA Detector {self.detector_id}",
+                "detection_interval": self.update_interval,
+                # Add any other configuration needed by the detector
+            }
+
             poll_data = {
                 "detector_id": self.detector_id,
-                "config": {
-                    "name": f"HA Detector {self.detector_id}",
-                    "detection_interval": self.update_interval,
-                    # Add any other configuration needed by the detector
-                },
+                "config": config_data,
             }
 
             # Make sure stream_url is in config if we have it
-            config = getattr(self, "_config", {})
-            if config and "stream_url" in config:
-                poll_data["config"]["stream_url"] = config["stream_url"]
+            if "stream_url" in self._config:
+                config_data["stream_url"] = self._config["stream_url"]
 
                 # Add other config options if they exist
                 for key in [
@@ -115,28 +120,34 @@ class YoloProcessingApiClient:
                     "detection_frame_count",
                     "consistent_detection_count",
                 ]:
-                    if key in config:
-                        poll_data["config"][key] = config[key]
-                
+                    if key in self._config:
+                        config_data[key] = self._config[key]
+
                 # Ensure update_interval from configuration is correctly passed
-                if "detection_interval" in config:
-                    poll_data["config"]["detection_interval"] = config["detection_interval"]
+                if "detection_interval" in self._config:
+                    config_data["detection_interval"] = self._config[
+                        "detection_interval"
+                    ]
 
             # Send the poll request
-            _LOGGER.debug("Polling YOLO server at %s with data: %s", self.base_url, poll_data)
+            _LOGGER.debug(
+                "Polling YOLO server at %s with data: %s", self.base_url, poll_data
+            )
             poll_url = f"{self.base_url}/poll"
 
             async with session.post(poll_url, json=poll_data) as response:
                 response_status = response.status
                 response_text = await response.text()
-                
+
                 # Log the complete request/response cycle
-                _LOGGER.debug("Poll response (HTTP %s): %s", response_status, response_text)
-                
+                _LOGGER.debug(
+                    "Poll response (HTTP %s): %s", response_status, response_text
+                )
+
                 if response_status == 200:
                     try:
                         result = json.loads(response_text)
-                        
+
                         if result.get("status") == "success":
                             # Process the state
                             state = result.get("state", {})
@@ -153,15 +164,18 @@ class YoloProcessingApiClient:
                             self._last_error = result.get("message", "Unknown error")
                     except json.JSONDecodeError as err:
                         _LOGGER.error(
-                            "Failed to parse server response: %s. Raw response: %s", 
-                            err, response_text[:200]
+                            "Failed to parse server response: %s. Raw response: %s",
+                            err,
+                            response_text[:200],
                         )
                         self._available = False
                         self._last_error = f"JSON parse error: {err}"
                 else:
                     _LOGGER.error(
-                        "Failed to poll server: HTTP %s %s. Response: %s", 
-                        response_status, response.reason, response_text[:200]
+                        "Failed to poll server: HTTP %s %s. Response: %s",
+                        response_status,
+                        response.reason,
+                        response_text[:200],
                     )
                     self._available = False
                     self._last_error = f"HTTP {response_status} {response.reason}"
@@ -169,7 +183,7 @@ class YoloProcessingApiClient:
         except aiohttp.ClientError as err:
             _LOGGER.error("Connection error: %s", err)
             self._available = False
-            self._last_error = str(err)
+            self._last_error = f"Connection error: {err}"
         except asyncio.TimeoutError:
             _LOGGER.error("Connection timeout")
             self._available = False
@@ -177,7 +191,7 @@ class YoloProcessingApiClient:
         except Exception as ex:
             _LOGGER.exception("Unexpected error updating from server: %s", ex)
             self._available = False
-            self._last_error = str(ex)
+            self._last_error = f"Unexpected error: {ex}"
 
     async def _handle_state_update(self, state: Dict[str, Any]) -> None:
         """Handle a state update."""
@@ -201,7 +215,7 @@ class YoloProcessingApiClient:
             self._pet_detected = pet_detected
             self._human_count = human_count
             self._pet_count = pet_count
-            self._last_update = dt_util.utcnow()
+            self._last_update = dt_util.utcnow() if state_changed else self._last_update
 
             # Fire events
             if human_detected != self._human_detected:
@@ -249,11 +263,11 @@ class YoloProcessingApiClient:
         if self._closed:
             _LOGGER.debug("Client already closed, skipping shutdown")
             return
-            
+
         try:
             # Mark as closed early to prevent new sessions from being created
             self._closed = True
-            
+
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
@@ -261,9 +275,11 @@ class YoloProcessingApiClient:
             # Optionally tell the server to shut down this detector
             try:
                 shutdown_data = {"detector_id": self.detector_id}
-                
+
                 # Use a context manager to ensure the session is properly closed
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as session:
                     async with session.post(
                         f"{self.base_url}/shutdown", json=shutdown_data
                     ) as response:

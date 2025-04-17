@@ -227,6 +227,13 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "your hardware. Leave this disabled if you want full manual control."
         )
 
+        detection_settings_info = (
+            "The 'detection_frame_count' setting defines how many frames are analyzed in each "
+            "detection cycle. The 'consistent_detection_count' setting determines how many "
+            "of those frames must contain a positive detection to trigger presence. The "
+            "consistent detection count should always be less than or equal to the frame count."
+        )
+
         return self.async_show_form(
             step_id="user",
             data_schema=data_schema,
@@ -234,6 +241,7 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "architecture_info": compatibility_message,
                 "optimization_info": optimization_info,
+                "detection_settings_info": detection_settings_info,
             },
         )
 
@@ -410,9 +418,19 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
             "your hardware. Leave this disabled if you want full manual control."
         )
 
+        detection_settings_info = (
+            "The 'detection_frame_count' setting defines how many frames are analyzed in each "
+            "detection cycle. The 'consistent_detection_count' setting determines how many "
+            "of those frames must contain a positive detection to trigger presence. The "
+            "consistent detection count should always be less than or equal to the frame count."
+        )
+
         return self.async_show_form(
             step_id="init",
             data_schema=data_schema,
             errors=errors,
-            description_placeholders={"optimization_info": optimization_info},
+            description_placeholders={
+                "optimization_info": optimization_info,
+                "detection_settings_info": detection_settings_info,
+            },
         )

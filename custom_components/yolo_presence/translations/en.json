@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "YOLO Presence Detection",
-        "description": "Set up YOLO-based detection for people and pets. {architecture_info}",
+        "description": "Set up YOLO-based detection for people and pets. {architecture_info}\n\n{detection_settings_info}",
         "data": {
           "name": "Name of the integration instance",
           "processing_server": "Processing Server Host/IP",
@@ -17,7 +17,7 @@
           "input_size": "Resolution for processing (higher is more accurate but slower)",
           "frame_skip_rate": "Process 1 frame and skip X frames",
           "detection_frame_count": "Number of frames to analyze for each detection run",
-          "consistent_detection_count": "Required consecutive detections before triggering presence"
+          "consistent_detection_count": "Required consecutive detections before triggering presence (must be less than frames to analyze)"
         }
       }
     },
@@ -35,7 +35,7 @@
     "step": {
       "init": {
         "title": "YOLO Presence Options",
-        "description": "Configure detection parameters. {optimization_info}",
+        "description": "Configure detection parameters. {optimization_info}\n\n{detection_settings_info}",
         "data": {
           "processing_server": "Processing Server Host/IP",
           "processing_server_port": "Processing Server Port",
@@ -48,7 +48,7 @@
           "input_size": "Resolution for processing (higher is more accurate but slower)",
           "frame_skip_rate": "Process 1 frame and skip X frames",
           "detection_frame_count": "Number of frames to analyze for each detection run",
-          "consistent_detection_count": "Required consecutive detections before triggering presence"
+          "consistent_detection_count": "Required consecutive detections before triggering presence (must be less than frames to analyze)"
         }
       }
     },
