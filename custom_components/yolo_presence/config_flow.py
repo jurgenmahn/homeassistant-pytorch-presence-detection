@@ -228,8 +228,8 @@ class YoloPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
         detection_settings_info = (
-            "The 'detection_frame_count' setting defines how many frames are analyzed in each "
-            "detection cycle. The 'consistent_detection_count' setting determines how many "
+            "The 'Number of frames to analyze for each detection run' setting defines how many frames are analyzed in each "
+            "detection cycle. The 'Required consecutive detections before triggering presence' setting determines how many "
             "of those frames must contain a positive detection to trigger presence. The "
             "consistent detection count should always be less than or equal to the frame count."
         )
@@ -419,8 +419,8 @@ class YoloPresenceOptionsFlow(config_entries.OptionsFlow):
         )
 
         detection_settings_info = (
-            "The 'detection_frame_count' setting defines how many frames are analyzed in each "
-            "detection cycle. The 'consistent_detection_count' setting determines how many "
+            "The 'Number of frames to analyze for each detection run' setting defines how many frames are analyzed in each "
+            "detection cycle. The 'Required consecutive detections before triggering presence' setting determines how many "
             "of those frames must contain a positive detection to trigger presence. The "
             "consistent detection count should always be less than or equal to the frame count."
         )
